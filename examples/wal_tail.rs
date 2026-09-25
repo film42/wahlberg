@@ -4,7 +4,7 @@ use std::thread;
 use std::time::Duration;
 
 use clap::Parser;
-use wahlberg::wal;
+use walburg::wal;
 
 #[derive(Parser)]
 #[command(
@@ -95,7 +95,7 @@ fn main() {
                     );
 
                     for op in &ops {
-                        use wahlberg::eavc::OpType;
+                        use walburg::eavc::OpType;
                         let op_label = match op.op {
                             OpType::Create => "\x1b[32m+\x1b[0m",
                             OpType::Update => "\x1b[33m~\x1b[0m",

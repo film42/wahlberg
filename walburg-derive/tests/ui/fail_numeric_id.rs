@@ -1,10 +1,9 @@
 use serde::{Deserialize, Serialize};
-use wahlberg::Record;
+use walburg::Record;
 
 #[derive(Serialize, Deserialize, Record)]
-enum Status {
-    Open,
-    Closed,
+struct User {
+    id: u64,
 }
 
 fn main() {}

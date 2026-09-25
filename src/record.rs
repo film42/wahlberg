@@ -2,7 +2,7 @@
 //!
 //! ```
 //! use serde::{Deserialize, Serialize};
-//! use wahlberg::{Record, store::Store};
+//! use walburg::{Record, store::Store};
 //!
 //! #[derive(Serialize, Deserialize, Record)]
 //! #[record(table = "users")]
@@ -13,7 +13,7 @@
 //! let mut users = store.table::<User>();
 //! users.insert(&User { id: "u-1".into(), name: "Alice".into(), email: "a@x.com".into() })?;
 //! users.update("u-1", |u| u.email = "new@x.com".into())?; // writes only `email`
-//! # Ok::<(), wahlberg::RecordError>(())
+//! # Ok::<(), walburg::RecordError>(())
 //! ```
 //!
 //! A record maps to an entity: each key of the struct's serde JSON object is

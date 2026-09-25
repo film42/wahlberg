@@ -7,8 +7,8 @@
 //!     cargo run --example records
 
 use serde::{Deserialize, Serialize};
-use wahlberg::Record;
-use wahlberg::store::Store;
+use walburg::Record;
+use walburg::store::Store;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Record)]
 #[record(table = "contacts")]

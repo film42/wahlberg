@@ -5,9 +5,9 @@ use std::thread;
 
 use serde_json::Value;
 use tempfile::TempDir;
-use wahlberg::eavc::{Op, OpType};
-use wahlberg::store::Store;
-use wahlberg::wal;
+use walburg::eavc::{Op, OpType};
+use walburg::store::Store;
+use walburg::wal;
 
 // ---------------------------------------------------------------------------
 // helpers

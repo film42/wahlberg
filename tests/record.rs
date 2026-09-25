@@ -3,8 +3,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tempfile::TempDir;
-use wahlberg::store::Store;
-use wahlberg::{Record, RecordError};
+use walburg::store::Store;
+use walburg::{Record, RecordError};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Record)]
 #[record(table = "users")]

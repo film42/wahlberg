@@ -1,9 +1,9 @@
 use serde::{Deserialize, Serialize};
-use wahlberg::Record;
+use walburg::Record;
 
 #[derive(Serialize, Deserialize, Record)]
-#[record(tabel = "users")]
 struct User {
+    #[serde(rename(serialize = "a", deserialize = "b"))]
     id: String,
 }
 

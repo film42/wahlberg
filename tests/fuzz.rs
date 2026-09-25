@@ -33,9 +33,9 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 use ulid::Ulid;
-use wahlberg::eavc::{self, Op, OpType};
-use wahlberg::store::Store;
-use wahlberg::wal;
+use walburg::eavc::{self, Op, OpType};
+use walburg::store::Store;
+use walburg::wal;
 
 // ---------------------------------------------------------------------------
 // rng

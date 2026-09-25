@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use rusqlite::{Connection, params};
-use wahlberg::store::Store;
+use walburg::store::Store;
 
 #[derive(Parser)]
 #[command(name = "wal-exporter", about = "Sync WAL ops into a SQLite database")]

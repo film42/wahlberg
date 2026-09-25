@@ -1,8 +1,8 @@
 [package]
-name = "wahlberg-derive"
+name = "walburg-derive"
 version = "0.1.0"
 edition = "2024"
-description = "#[derive(Record)] for the wahlberg store"
+description = "#[derive(Record)] for the walburg store"
 
 [lib]
 proc-macro = true
@@ -13,8 +13,8 @@ quote = "1"
 syn = { version = "2", features = ["full"] }
 
 [dev-dependencies]
-# Dev-only cycle (wahlberg depends on this crate): lets compile-fail tests
+# Dev-only cycle (walburg depends on this crate): lets compile-fail tests
 # exercise the macro exactly as users see it.
-wahlberg = { path = ".." }
+walburg = { path = ".." }
 serde = { version = "1", features = ["derive"] }
 trybuild = "1"

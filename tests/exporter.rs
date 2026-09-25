@@ -1,7 +1,7 @@
 use std::process::Command;
 
 use serde_json::Value;
-use wahlberg::store::Store;
+use walburg::store::Store;
 
 fn exporter_bin() -> std::path::PathBuf {
     // Build path to the example binary in the same target dir as tests.

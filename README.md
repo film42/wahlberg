@@ -1,4 +1,4 @@
-# Wahlberg
+# Walburg
 
 An append-only WAL (Write-Ahead Log) protocol and storage engine for offline-first, multi-writer applications. Data replicates through a shared directory of immutable NDJSON files. No server, no coordination, no locks.
 
@@ -252,7 +252,7 @@ The source set is exactly the files the compactor successfully read. Files it co
 ## Rust Library Usage
 
 ```rust
-use wahlberg::store::Store;
+use walburg::store::Store;
 use serde_json::Value;
 
 // Open a store backed by a WAL directory.
@@ -292,7 +292,7 @@ Derive `Record` on a serde struct to get a typed table instead of field tuples (
 
 ```rust
 use serde::{Deserialize, Serialize};
-use wahlberg::Record;
+use walburg::Record;
 
 #[derive(Serialize, Deserialize, Record)]
 #[record(table = "contacts")]   // default: the struct name in snake_case

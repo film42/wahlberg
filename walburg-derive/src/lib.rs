@@ -1,8 +1,8 @@
-//! `#[derive(Record)]` for wahlberg. Use it through `wahlberg::Record`.
+//! `#[derive(Record)]` for walburg. Use it through `walburg::Record`.
 //!
 //! ```
 //! use serde::{Deserialize, Serialize};
-//! use wahlberg::Record;
+//! use walburg::Record;
 //!
 //! #[derive(Serialize, Deserialize, Record)]
 //! #[record(table = "users")]
@@ -124,12 +124,12 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
         .make_where_clause()
         .predicates
         .push(syn::parse_quote! {
-            Self: ::wahlberg::record::__private::Serialize
-                + ::wahlberg::record::__private::DeserializeOwned
+            Self: ::walburg::record::__private::Serialize
+                + ::walburg::record::__private::DeserializeOwned
         });
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
     Ok(quote! {
-        impl #impl_generics ::wahlberg::record::Record for #name #ty_generics #where_clause {
+        impl #impl_generics ::walburg::record::Record for #name #ty_generics #where_clause {
             const TABLE: &'static str = #table;
             const ID_FIELD: &'static str = #id_key;
             fn id(&self) -> &str {
