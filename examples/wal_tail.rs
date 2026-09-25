@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
@@ -37,6 +37,8 @@ fn main() {
     }
 
     let mut processed: BTreeSet<String> = BTreeSet::new();
+    // Unreadable files (often: not fully arrived yet) → last error, retried.
+    let mut failing: HashMap<String, String> = HashMap::new();
 
     loop {
         let files = match wal::list_wal_files(&args.wal_dir) {
@@ -63,10 +65,10 @@ fn main() {
                 continue;
             }
 
-            processed.insert(filename.clone());
-
             match wal::read_wal_file(&path) {
                 Ok((header, ops)) => {
+                    processed.insert(filename.clone());
+                    failing.remove(&filename);
                     let is_compact = header.t == "c";
 
                     if is_compact {
@@ -106,8 +108,8 @@ fn main() {
                         };
 
                         // Truncate long values.
-                        let display_val = if value_str.len() > 80 {
-                            format!("{}...", &value_str[..77])
+                        let display_val = if value_str.chars().count() > 80 {
+                            format!("{}...", value_str.chars().take(77).collect::<String>())
                         } else {
                             value_str
                         };
@@ -119,7 +121,11 @@ fn main() {
                     }
                 }
                 Err(e) => {
-                    eprintln!("\x1b[31m[error]\x1b[0m {} — {}", filename, e,);
+                    let msg = e.to_string();
+                    if failing.get(&filename) != Some(&msg) {
+                        eprintln!("\x1b[31m[error]\x1b[0m {} — {} (will retry)", filename, msg);
+                    }
+                    failing.insert(filename, msg);
                 }
             }
         }

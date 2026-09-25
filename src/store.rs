@@ -1,11 +1,10 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use chrono::Utc;
 use serde_json::Value;
 use ulid::Ulid;
 
-use crate::eavc::{Op, OpType};
+use crate::eavc::{self, Op, OpType};
 use crate::merge::{DELETED, MergeState, PURGE};
 use crate::wal::{self, WalError, WalReader};
 
@@ -38,6 +37,8 @@ pub struct Store {
     current: MergeState,
     /// Ops waiting to be flushed to disk.
     outbox: Vec<Op>,
+    /// tx of the last transaction this session wrote.
+    last_tx: Option<Ulid>,
 }
 
 impl Store {
@@ -52,6 +53,7 @@ impl Store {
             reader,
             current: MergeState::default(),
             outbox: Vec::new(),
+            last_tx: None,
         }
     }
 
@@ -72,21 +74,7 @@ impl Store {
         id: &str,
         fields: &[(&str, Value)],
     ) -> Result<(), StoreError> {
-        let now = Utc::now();
-        for (field, value) in fields {
-            let op = Op {
-                op_id: Ulid::new(),
-                tbl: tbl.into(),
-                id: id.into(),
-                op: OpType::Create,
-                field: field.to_string(),
-                value: value.clone(),
-                ts: now,
-                user: self.user.clone(),
-            };
-            self.apply_op(&op);
-            self.outbox.push(op);
-        }
+        self.write(tbl, id, OpType::Create, fields);
         Ok(())
     }
 
@@ -97,39 +85,14 @@ impl Store {
         id: &str,
         fields: &[(&str, Value)],
     ) -> Result<(), StoreError> {
-        let now = Utc::now();
-        for (field, value) in fields {
-            let op = Op {
-                op_id: Ulid::new(),
-                tbl: tbl.into(),
-                id: id.into(),
-                op: OpType::Update,
-                field: field.to_string(),
-                value: value.clone(),
-                ts: now,
-                user: self.user.clone(),
-            };
-            self.apply_op(&op);
-            self.outbox.push(op);
-        }
+        self.write(tbl, id, OpType::Update, fields);
         Ok(())
     }
 
     /// Soft-delete an entity. Fields are preserved; entity can be
     /// auto-restored if a newer field write arrives.
     pub fn delete(&mut self, tbl: &str, id: &str) -> Result<(), StoreError> {
-        let op = Op {
-            op_id: Ulid::new(),
-            tbl: tbl.into(),
-            id: id.into(),
-            op: OpType::Delete,
-            field: DELETED.into(),
-            value: Value::Bool(true),
-            ts: Utc::now(),
-            user: self.user.clone(),
-        };
-        self.apply_op(&op);
-        self.outbox.push(op);
+        self.write(tbl, id, OpType::Delete, &[(DELETED, Value::Bool(true))]);
         Ok(())
     }
 
@@ -138,18 +101,7 @@ impl Store {
     /// drop their copies too. Compaction will strip the field tuples from
     /// WAL files over time.
     pub fn purge(&mut self, tbl: &str, id: &str) -> Result<(), StoreError> {
-        let op = Op {
-            op_id: Ulid::new(),
-            tbl: tbl.into(),
-            id: id.into(),
-            op: OpType::Delete,
-            field: PURGE.into(),
-            value: Value::Bool(true),
-            ts: Utc::now(),
-            user: self.user.clone(),
-        };
-        self.apply_op(&op);
-        self.outbox.push(op);
+        self.write(tbl, id, OpType::Delete, &[(PURGE, Value::Bool(true))]);
         Ok(())
     }
 
@@ -214,6 +166,35 @@ impl Store {
 
     // --- internals ---
 
+    /// Records one transaction: applies it locally and queues it for flush.
+    fn write(&mut self, tbl: &str, id: &str, op: OpType, fields: &[(&str, Value)]) {
+        let tx = self.next_tx(tbl, id);
+        for op in eavc::transaction(tbl, id, op, fields, tx, &self.user) {
+            self.apply_op(&op);
+            self.outbox.push(op);
+        }
+    }
+
+    /// Picks the tx for a new transaction on (tbl, id): a fresh ULID, but
+    /// strictly greater than anything this session has written and anything
+    /// it has seen on the entity. So a write always beats the state it was
+    /// made against — even if the wall clock stepped back, or a peer's clock
+    /// runs ahead. When the fresh ULID isn't ahead, we increment the floor's
+    /// random part, so the embedded time only runs ahead of the wall clock
+    /// when the floor itself was ahead.
+    fn next_tx(&mut self, tbl: &str, id: &str) -> Ulid {
+        let fresh = Ulid::new();
+        let floor = self.current.entity_max_tx(tbl, id).max(self.last_tx);
+        let tx = match floor {
+            Some(f) if fresh <= f => f
+                .increment()
+                .unwrap_or_else(|| Ulid::from_parts(f.timestamp_ms() + 1, fresh.random())),
+            _ => fresh,
+        };
+        self.last_tx = Some(tx);
+        tx
+    }
+
     fn apply_op(&mut self, op: &Op) {
         self.current.apply(op.clone());
     }
@@ -221,7 +202,8 @@ impl Store {
     fn materialize_entity(&self, tbl: &str, id: &str) -> Option<Entity> {
         let mut fields = HashMap::new();
         let mut found = false;
-        let mut deleted = false;
+        let mut deleted_at = None;
+        let mut newest_field = None;
         let mut purged = false;
 
         for ((t, eid, field), op) in self.current.iter() {
@@ -230,9 +212,12 @@ impl Store {
                 if field == PURGE {
                     purged |= op.value == Value::Bool(true);
                 } else if field == DELETED {
-                    deleted |= op.value == Value::Bool(true);
+                    if op.value == Value::Bool(true) {
+                        deleted_at = Some(op.tx);
+                    }
                 } else if !field.starts_with('_') {
                     fields.insert(field.clone(), op.value.clone());
+                    newest_field = newest_field.max(Some(op.tx));
                 }
             }
         }
@@ -240,6 +225,14 @@ impl Store {
         if !found {
             return None;
         }
+
+        // Auto-restore: a field written after the delete means someone was
+        // still editing, so the entity is alive.
+        let deleted = match (deleted_at, newest_field) {
+            (Some(d), Some(f)) => f <= d,
+            (Some(_), None) => true,
+            (None, _) => false,
+        };
 
         Some(Entity {
             table: tbl.into(),

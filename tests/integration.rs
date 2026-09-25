@@ -44,7 +44,7 @@ fn wal_roundtrip_single_file() {
     let path = wal::write_wal(dir.path(), &ops, "s1", "test").unwrap();
     let (header, read_ops) = wal::read_wal_file(&path).unwrap();
 
-    assert_eq!(header.v, 2);
+    assert_eq!(header.v, wal::SUPPORTED_VERSION);
     assert_eq!(header.t, "f");
     assert_eq!(header.n, 3);
     assert_eq!(read_ops.len(), 3);
@@ -398,31 +398,28 @@ fn store_lww_latest_timestamp_wins() {
 
 #[test]
 fn store_lww_same_timestamp_higher_ulid_wins() {
-    use chrono::Utc;
     use ulid::Ulid;
 
     let dir = tmp();
-    let now = Utc::now();
+    let now = Ulid::new().timestamp_ms();
 
     let op_low = Op {
-        op_id: Ulid::from_parts(now.timestamp_millis() as u64, 0),
+        tx: Ulid::from_parts(now, 0),
         tbl: "t".into(),
         id: "1".into(),
         op: OpType::Update,
         field: "x".into(),
         value: Value::String("loser".into()),
-        ts: now,
         user: "a".into(),
     };
 
     let op_high = Op {
-        op_id: Ulid::from_parts(now.timestamp_millis() as u64, u128::MAX),
+        tx: Ulid::from_parts(now, u128::MAX),
         tbl: "t".into(),
         id: "1".into(),
         op: OpType::Update,
         field: "x".into(),
         value: Value::String("winner".into()),
-        ts: now,
         user: "b".into(),
     };
 

@@ -11,9 +11,10 @@ use ulid::Ulid;
 use crate::eavc::{Op, WalDebug, WalHeader};
 use crate::merge::MergeState;
 
-/// Highest WAL schema version this build understands. Files with a higher
-/// version are never parsed, merged, or deleted.
-pub const SUPPORTED_VERSION: u32 = 2;
+/// The WAL schema version this build reads and writes. Files with any other
+/// version are never parsed, merged, or deleted. v3 is not backwards
+/// compatible with v1/v2.
+pub const SUPPORTED_VERSION: u32 = 3;
 
 static FSYNC: AtomicBool = AtomicBool::new(true);
 
@@ -32,7 +33,7 @@ pub enum WalError {
     Json(#[from] serde_json::Error),
     #[error("corrupt WAL file {path}: {reason}")]
     Corrupt { path: PathBuf, reason: String },
-    #[error("unsupported WAL version {v} in {path} (max {SUPPORTED_VERSION})")]
+    #[error("unsupported WAL version {v} in {path} (expected {SUPPORTED_VERSION})")]
     UnsupportedVersion { path: PathBuf, v: u32 },
 }
 
@@ -132,8 +133,8 @@ fn write_verified(
             v: SUPPORTED_VERSION,
             t: file_type.into(),
             n: ops.len(),
-            lo: ops.iter().map(|o| o.op_id).min().unwrap(),
-            hi: ops.iter().map(|o| o.op_id).max().unwrap(),
+            lo: ops.iter().map(|o| o.tx).min().unwrap(),
+            hi: ops.iter().map(|o| o.tx).max().unwrap(),
         };
         write_line(&mut w, &header)?;
         let debug = WalDebug {
@@ -218,22 +219,20 @@ pub fn read_wal_file(path: &Path) -> Result<(WalHeader, Vec<Op>), WalError> {
 
     let header: WalHeader = serde_json::from_str(&header_line)?;
 
-    // Refuse newer formats outright: parsing them with this build's schema
-    // would silently drop fields we don't know about.
-    if header.v == 0 || header.v > SUPPORTED_VERSION {
+    // Refuse other formats outright: parsing them with this build's schema
+    // would silently drop or misread fields.
+    if header.v != SUPPORTED_VERSION {
         return Err(WalError::UnsupportedVersion {
             path: path.to_path_buf(),
             v: header.v,
         });
     }
 
-    // v2 has a debug line after the header — skip it.
-    if header.v >= 2 {
-        lines.next().ok_or_else(|| WalError::Corrupt {
-            path: path.to_path_buf(),
-            reason: "missing debug line".into(),
-        })??;
-    }
+    // Debug line — metadata for humans, not parsed.
+    lines.next().ok_or_else(|| WalError::Corrupt {
+        path: path.to_path_buf(),
+        reason: "missing debug line".into(),
+    })??;
 
     // Don't trust `n` for allocation — a corrupt header could claim 2^60 ops.
     let mut ops = Vec::with_capacity(header.n.min(4096));
@@ -386,8 +385,9 @@ pub fn compact(dir: &Path, session_id: &str) -> Result<Option<PathBuf>, WalError
     }
 
     let mut merged_ops = state.into_ops();
-    // Sort by op_id for deterministic output.
-    merged_ops.sort_by_key(|op| op.op_id);
+    // Deterministic output order.
+    merged_ops
+        .sort_by(|a, b| (a.tx, &a.tbl, &a.id, &a.field).cmp(&(b.tx, &b.tbl, &b.id, &b.field)));
 
     let compact_path = if merged_ops.is_empty() {
         // Every source was verified readable and held no ops.
@@ -440,7 +440,7 @@ mod tests {
         assert!(path.exists());
 
         let (header, read_ops) = read_wal_file(&path).unwrap();
-        assert_eq!(header.v, 2);
+        assert_eq!(header.v, SUPPORTED_VERSION);
         assert_eq!(header.t, "f");
         assert_eq!(header.n, 2);
         assert_eq!(read_ops.len(), 2);

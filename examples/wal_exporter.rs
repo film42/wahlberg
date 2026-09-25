@@ -48,23 +48,25 @@ fn main() {
 
     let tx = db.unchecked_transaction().unwrap();
 
+    // The output mirrors materialized state exactly, so rebuild it. Anything
+    // purged (or otherwise gone) since the last export disappears; with
+    // secure_delete on, its bytes are overwritten rather than left in free pages.
+    tx.execute_batch("DELETE FROM fields; DELETE FROM entities;")
+        .unwrap();
+
     for table in &tables {
         let entities = store.list_all(table);
         for entity in &entities {
-            // Upsert into the entities table.
             tx.execute(
-                "INSERT INTO entities (tbl, id, deleted) VALUES (?1, ?2, ?3)
-                 ON CONFLICT(tbl, id) DO UPDATE SET deleted = excluded.deleted",
+                "INSERT INTO entities (tbl, id, deleted) VALUES (?1, ?2, ?3)",
                 params![table, entity.id, entity.deleted],
             )
             .unwrap();
 
-            // Upsert each field.
             for (attr, value) in &entity.fields {
                 let value_str = serde_json::to_string(value).unwrap();
                 tx.execute(
-                    "INSERT INTO fields (tbl, id, attribute, value) VALUES (?1, ?2, ?3, ?4)
-                     ON CONFLICT(tbl, id, attribute) DO UPDATE SET value = excluded.value",
+                    "INSERT INTO fields (tbl, id, attribute, value) VALUES (?1, ?2, ?3, ?4)",
                     params![table, entity.id, attr, value_str],
                 )
                 .unwrap();
@@ -74,9 +76,6 @@ fn main() {
             total_entities += 1;
         }
     }
-
-    // Remove fields that no longer exist (entity was deleted and fields cleared).
-    // We keep all fields for now since soft-delete preserves field data.
 
     tx.commit().unwrap();
 
@@ -91,7 +90,9 @@ fn main() {
 
 fn create_schema(db: &Connection) {
     db.execute_batch(
-        "CREATE TABLE IF NOT EXISTS entities (
+        "PRAGMA secure_delete = ON;
+
+        CREATE TABLE IF NOT EXISTS entities (
             tbl      TEXT NOT NULL,
             id       TEXT NOT NULL,
             deleted  INTEGER NOT NULL DEFAULT 0,

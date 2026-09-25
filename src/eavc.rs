@@ -4,12 +4,14 @@ use ulid::Ulid;
 
 /// A single EAVC operation: one field-level change to an entity.
 ///
-/// The "C" in EAVC is context — the op_id, timestamp, and author that
-/// give provenance to every fact in the system.
+/// The "C" in EAVC is context — the transaction id and author that give
+/// provenance to every fact in the system.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Op {
-    #[serde(rename = "opId")]
-    pub op_id: Ulid,
+    /// Transaction id, shared by every op in the transaction. A ULID is a
+    /// 48-bit millisecond timestamp followed by 80 random bits, so this one
+    /// field is both the op's time and its LWW tiebreak.
+    pub tx: Ulid,
     pub tbl: String,
     pub id: String,
     pub op: OpType,
@@ -21,8 +23,14 @@ pub struct Op {
         deserialize_with = "deserialize_value_from_string"
     )]
     pub value: serde_json::Value,
-    pub ts: DateTime<Utc>,
     pub user: String,
+}
+
+impl Op {
+    /// When the transaction happened: the timestamp embedded in `tx`.
+    pub fn ts(&self) -> DateTime<Utc> {
+        DateTime::from_timestamp_millis(self.tx.timestamp_ms() as i64).unwrap()
+    }
 }
 
 fn serialize_value_as_string<S: Serializer>(
@@ -91,13 +99,13 @@ pub struct WalHeader {
     pub t: String,
     /// Number of ops in the file.
     pub n: usize,
-    /// Lowest op_id in the file.
+    /// Lowest tx in the file.
     pub lo: Ulid,
-    /// Highest op_id in the file.
+    /// Highest tx in the file.
     pub hi: Ulid,
 }
 
-/// Debug line written after the header (v2 format).
+/// Debug line written after the header.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalDebug {
     pub sid: String,
@@ -105,7 +113,38 @@ pub struct WalDebug {
     pub at: DateTime<Utc>,
 }
 
+/// Builds the ops for one transaction on one entity, all sharing `tx`.
+///
+/// Because every field compares with the same `tx`, a transaction wins or
+/// loses as a unit — two transactions can never interleave field-by-field.
+/// A transaction sets each field at most once; for a repeated field the last
+/// value wins.
+pub fn transaction(
+    tbl: &str,
+    id: &str,
+    op: OpType,
+    fields: &[(&str, serde_json::Value)],
+    tx: Ulid,
+    user: &str,
+) -> Vec<Op> {
+    let mut ops: Vec<Op> = Vec::with_capacity(fields.len());
+    for (field, value) in fields {
+        ops.retain(|o| o.field != *field);
+        ops.push(Op {
+            tx,
+            tbl: tbl.into(),
+            id: id.into(),
+            op: op.clone(),
+            field: field.to_string(),
+            value: value.clone(),
+            user: user.into(),
+        });
+    }
+    ops
+}
+
 impl Op {
+    /// A single-op transaction stamped now.
     pub fn new(
         tbl: impl Into<String>,
         id: impl Into<String>,
@@ -115,13 +154,12 @@ impl Op {
         user: impl Into<String>,
     ) -> Self {
         Self {
-            op_id: Ulid::new(),
+            tx: Ulid::new(),
             tbl: tbl.into(),
             id: id.into(),
             op,
             field: field.into(),
             value,
-            ts: Utc::now(),
             user: user.into(),
         }
     }

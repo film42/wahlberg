@@ -11,7 +11,7 @@ Every mutation in the system is a single **op** — one field-level fact about o
 | **E** (Entity) | Identified by `(tbl, id)`. `tbl` is a freeform table name, `id` is a unique entity identifier. |
 | **A** (Attribute) | The `field` being set. Freeform string. |
 | **V** (Value) | The value for that field. Any JSON-representable scalar. |
-| **C** (Context) | Provenance: `opId` (ULID), `ts` (ISO 8601 timestamp), `user` (user ID of who wrote it). |
+| **C** (Context) | Provenance: `tx` (transaction ULID, which carries the timestamp), `user` (user ID of who wrote it). |
 
 An entity is not a single record — it is the set of all winning facts for a given `(tbl, id)` pair, materialized by applying LWW across all ops.
 
@@ -19,27 +19,36 @@ An entity is not a single record — it is the set of all winning facts for a gi
 
 ```json
 {
-  "opId": "01KRMC0JM9WYZJD74TJ1K1DRB8",
+  "tx":   "01KRMC0JM9WYZJD74TJ1K1DRB8",
   "tbl":  "accounts",
   "id":   "acc-42",
   "op":   "U",
   "field":"name",
   "value":"\"Alice\"",
-  "ts":   "2026-05-14T23:09:11.176Z",
   "user": "Garrett"
 }
 ```
 
 | Field   | Type   | Description |
 |---------|--------|-------------|
-| `opId`  | ULID   | Globally unique, monotonic within a session. Used as LWW tiebreaker. |
+| `tx`    | ULID   | Transaction ID, shared by every op in the transaction. It is the op's **timestamp and LWW key** in one field (see [Why `tx` is a ULID](#why-tx-is-a-ulid)). |
 | `tbl`   | string | Table/collection name. Freeform — any string is valid. |
 | `id`    | string | Entity identifier. Unique within a table. |
 | `op`    | string | `"C"` (create), `"U"` (update), or `"D"` (delete). **Informational only** — the materializer does not branch on this. All ops are idempotent writes. |
 | `field` | string | The attribute being set. System fields start with `_` (see [Tombstones](#tombstones)). |
 | `value` | string | **JSON-stringified** value. `"\"Alice\""` for a string, `"42"` for a number, `"true"` for a boolean. Parsed back to a typed value on read. |
-| `ts`    | string | ISO 8601 UTC timestamp. All ops in a single transaction share the same `ts`. |
 | `user`  | string | User ID of the author. In systems without a user registry, this may be a display name. |
+
+### Why `tx` is a ULID
+
+A ULID is a 48-bit millisecond Unix timestamp followed by 80 random bits, encoded as 26 characters of Crockford base32. So one `tx` field carries everything that a separate timestamp and a unique tiebreak ID would:
+
+- **Time:** the op's timestamp is the first 10 characters (`01KRMC0JM9` → `2026-05-14T23:09:11.177Z`). Every ULID library can extract it; there is no separate `ts` field because it would duplicate these bits.
+- **Order:** comparing two ULIDs compares their timestamps first and their random bits second, which gives LWW a total order with a deterministic tiebreak. The canonical encoding is fixed-width, so string order equals ULID order.
+
+Implementations MUST compare `tx` as a ULID (or as its canonical uppercase string). Crockford base32 is case-insensitive, so a lowercase `tx` denotes the same value.
+
+This is purely a space saving over storing `ts` + a per-op ID: 34 bytes per op instead of 68.
 
 ### Value Encoding
 
@@ -69,16 +78,16 @@ WAL files are NDJSON (newline-delimited JSON). Each file has three sections:
 ### Header (line 1)
 
 ```json
-{"v":2,"t":"f","n":9,"lo":"01KRM...","hi":"01KRM..."}
+{"v":3,"t":"f","n":9,"lo":"01KRM...","hi":"01KRM..."}
 ```
 
 | Field | Type   | Description |
 |-------|--------|-------------|
-| `v`   | integer | Schema version. Current: `2`. Readers MUST NOT parse files with a version higher than they support (unknown fields would be silently dropped). Compactors MUST NOT merge or delete them. |
+| `v`   | integer | Schema version. Current: `3`. v3 is not backwards compatible with v1/v2. Readers MUST NOT parse files with a version they don't support (fields would be silently dropped or misread), and compactors MUST NOT merge or delete them. |
 | `t`   | string  | File type: `"f"` = fragment, `"c"` = compact. |
 | `n`   | integer | Number of ops in the file (not counting header or debug lines). |
-| `lo`  | ULID    | Lowest `opId` in the file. |
-| `hi`  | ULID    | Highest `opId` in the file. |
+| `lo`  | ULID    | Lowest `tx` in the file. |
+| `hi`  | ULID    | Highest `tx` in the file. |
 
 ### Debug (line 2)
 
@@ -124,12 +133,11 @@ This ensures readers never see a partial file. Any filesystem that supports atom
 
 Every `(tbl, id, field)` tuple has exactly one winning value at any point in time, determined by LWW:
 
-1. **Higher `ts` wins.** The op with the later timestamp takes precedence.
-2. **On tie, higher `opId` wins.** ULIDs are lexicographically comparable, providing a deterministic tiebreaker.
+**Higher `tx` wins.** Because a ULID's timestamp is its most significant part, this means the later transaction wins; within the same millisecond, the random bits decide deterministically. The one exception is `_purge` (see [Tombstones](#tombstones)).
 
 This means:
 - Two users editing **different fields** on the same entity: both writes survive. No conflict.
-- Two users editing the **same field** at the same time: the later timestamp wins. Deterministic, no coordination needed.
+- Two users editing the **same field** at the same time: the later `tx` wins. Deterministic, no coordination needed.
 - Any set of ops applied in any order produces the **same final state**. The system is convergent.
 
 ### Materialization
@@ -148,7 +156,7 @@ System fields (prefixed with `_`) control entity lifecycle. They participate in 
 
 Setting `_deleted` to `true` marks an entity as soft-deleted. The entity's field data is preserved. Readers SHOULD exclude soft-deleted entities from default queries but MAY expose them through explicit "include deleted" APIs.
 
-**Auto-restore rule:** If any non-system field has a `ts` newer than the `_deleted` field's `ts`, the entity is considered alive. This handles the case where user A deletes an entity while user B (who hasn't synced yet) edits a field — the edit wins, and the entity comes back. This is intentional: if someone was actively editing it, the delete was premature.
+**Auto-restore rule:** If any non-system field has a `tx` greater than the `_deleted` field's `tx`, the entity is considered alive. This handles the case where user A deletes an entity while user B (who hasn't synced yet) edits a field — the edit wins, and the entity comes back. This is intentional: if someone was actively editing it, the delete was premature.
 
 To undo a soft delete explicitly, write `_deleted` with value `false`.
 
@@ -163,20 +171,25 @@ Setting `_purge` to `true` permanently removes an entity. Unlike soft delete:
 
 Purge is eventual. Field tuples may exist in WAL files on disk until compaction runs. Over successive compaction passes, all field data for purged entities is eroded from the filesystem. The tombstone itself persists indefinitely (it is the only record that the entity ever existed and should not be re-created).
 
-**Purge wins over everything.** A `_purge` tombstone cannot be overridden by a newer field write, nor by a `_purge` write with any other value, regardless of timestamp. For the `_purge` field, `true` beats every non-`true` value; among `true` values, normal LWW applies. Once purged, the entity is gone.
+**Purge wins over everything.** A `_purge` tombstone cannot be overridden by a newer field write, nor by a `_purge` write with any other value, regardless of `tx`. For the `_purge` field, `true` beats every non-`true` value; among `true` values, normal LWW applies. Once purged, the entity is gone.
 
 This irreversibility is load-bearing: it is what makes it safe for a compactor with a partial view of the WAL to strip field data. If purge could be undone, a compactor that saw the purge but not the later un-purge would destroy data permanently.
 
 ## Transactions
 
-There is no dedicated transaction ID. All ops in a single logical action MUST share the same `ts` value. This is the transaction boundary: `(id, ts)` groups ops that were part of the same mutation.
+Every op produced by one logical action on one entity shares the same `tx`. `tx` is the transaction ID: group ops by `tx` to recover transaction boundaries.
 
 Writers MUST:
-- Generate a single timestamp at the start of an action.
-- Assign that timestamp to every op produced by that action.
-- Generate a unique `opId` (ULID) for each individual op.
+- Generate one `tx` per action and assign it to every op the action produces.
+- Set each field at most once per transaction.
 
-Readers that need to identify transaction boundaries can group ops by `(id, ts)`.
+A shared `tx` means transactions never tear. Two transactions that land in the same millisecond still compare the same way on every field, so one wins entirely. They can't end up with A winning field `a` while B wins field `b`.
+
+### Choosing `tx`
+
+A writer SHOULD generate a fresh ULID for `tx`, but it MUST be strictly greater than (a) the last `tx` it wrote and (b) every `tx` it has seen on the target entity. If the fresh ULID isn't greater, increment the largest of those by one instead (monotonic ULID increment).
+
+This guarantees that a write always beats the state it was made against. Rapid edits never tie. An edit or delete made after syncing a write from a peer whose clock runs ahead still sticks, instead of silently losing. And a delete is never instantly undone by auto-restore. Because the floor is bumped by incrementing its random bits, the embedded time only runs ahead of the wall clock when the floor itself was ahead. In effect, `tx` behaves like a hybrid logical clock.
 
 ## Replication
 
@@ -276,7 +289,8 @@ let tables = store.tables();
 ### Examples
 
 ```bash
-# Export WAL to SQLite
+# Export WAL to SQLite (rebuilds the output to mirror current state;
+# purged data is removed and overwritten via PRAGMA secure_delete)
 cargo run --example wal-exporter -- --wal-dir ./wal --output-db ./out.db
 
 # Tail WAL directory (one-shot or follow mode)
@@ -288,9 +302,9 @@ cargo run --example wal-tail -- --wal-dir ./wal -f
 
 To implement a compatible reader/writer, you need:
 
-1. **ULID generation** — monotonic within a session, globally unique. Libraries exist for every major language.
+1. **ULID generation** — with monotonic increment support (for [Choosing `tx`](#choosing-tx)). Libraries exist for every major language.
 2. **NDJSON parsing** — read one JSON object per line.
-3. **A `HashMap<(tbl, id, field), Fact>` for materialized state** — where `Fact` holds `{value, ts, opId}`. On each op, compare with the existing fact using LWW rules and keep the winner.
+3. **A `HashMap<(tbl, id, field), Fact>` for materialized state** — where `Fact` holds `{value, tx}`. On each op, compare with the existing fact using LWW rules and keep the winner.
 4. **Atomic file writes** — write to tmp, rename to final.
 5. **File listing + sorting** — list `.wal` files, sort lexicographically (ULID order), track which ones you've processed.
 
@@ -302,7 +316,7 @@ That's it. There is no handshake, no protocol negotiation, no schema registry. T
 function wins(new, old):
     if new.field == "_purge" and is_purge(new) != is_purge(old):
         return is_purge(new)            // purge is irreversible
-    return new.ts > old.ts or (new.ts == old.ts and new.opId > old.opId)
+    return new.tx > old.tx             // ULID order: time, then random bits
 
 function apply(op, current_state):
     if op.field != "_purge" and is_purged(op.tbl, op.id, current_state):
@@ -356,7 +370,7 @@ function consume(wal_dir, processed_set):
 
 ## Design Assumptions
 
-- **Clocks are reasonably synchronized.** LWW depends on timestamps being "close enough" (NTP-level). A machine with a clock 5 minutes ahead will silently win all conflicts. This is acceptable for small teams on real computers; not suitable for adversarial or high-clock-skew environments.
+- **Clocks are reasonably synchronized.** LWW depends on timestamps being "close enough" (NTP-level). A machine with a clock 5 minutes ahead will win conflicts against *concurrent* writes. Writes made after syncing its data still win, because of the rule in [Choosing `tx`](#choosing-tx). This is acceptable for small teams on real computers; not suitable for adversarial or high-clock-skew environments.
 - **Writers are trusted.** Any writer can write any field to any table. There is no schema enforcement at the protocol level. Validation belongs in the application layer.
 - **The shared directory is durable.** The protocol assumes files, once committed, are not silently corrupted or truncated by the filesystem. It handles missing files (compaction may remove them) and corrupt files (header validation) gracefully.
 
@@ -364,20 +378,9 @@ function consume(wal_dir, processed_set):
 
 ### Hybrid Logical Clocks (HLC)
 
-The current protocol uses wall-clock timestamps (`ts`) for LWW ordering. This works well when peers have reasonably synchronized clocks (NTP), but breaks down in environments with significant clock skew — a peer whose clock is ahead will silently win every conflict, even when its writes are causally later.
+[Choosing `tx`](#choosing-tx) already gives the main HLC guarantee: if peer A writes, and peer B syncs and then writes the same entity, B's write wins even if B's wall clock is behind. It does this with no extra wire fields.
 
-A Hybrid Logical Clock replaces the raw wall-clock timestamp with a `(physical_time, logical_counter, node_id)` tuple. The physical component tracks real time (like `ts` does today), but the logical counter increments when a node receives an event with a physical time equal to or greater than its own — ensuring that causally-later events always have a higher HLC value, even if the wall clock hasn't advanced.
-
-What this would change in the protocol:
-
-- The `ts` field would become an HLC value instead of a raw ISO 8601 timestamp. The wire encoding could be a single sortable string (e.g. `"{physical_ms}-{logical}-{node}"`) to preserve lexicographic comparison.
-- LWW comparison would use HLC ordering instead of raw timestamp comparison. The ULID tiebreak would remain as a fallback for true ties.
-- Writers would need to maintain HLC state: on each local event, `physical = max(wall_clock, last_physical)` and increment the logical counter. On receiving remote ops (during sync), advance the local HLC if the remote HLC is ahead.
-- Transaction grouping (`(id, ts)`) would still work — all ops in a transaction share the same HLC value.
-
-The key benefit is **causal consistency without coordination**: if peer A writes, peer B syncs and then writes, B's write is guaranteed to have a higher HLC than A's — even if B's wall clock is behind. This eliminates the silent-winner problem for peers that communicate, while remaining compatible with the append-only WAL architecture.
-
-HLC adds minimal overhead (one counter per node, one comparison per op) and does not require changes to the file format, compaction, or replication model. It is a drop-in replacement for the timestamp comparison in the LWW function.
+A full HLC would extend that from "the entity you wrote" to "everything you've synced" (advance the local clock on every remote op, not just on the target entity's). It has the same tradeoff as any HLC: one machine with a badly wrong clock drags everyone's `tx` forward. That's worth doing only if cross-entity causality starts to matter.
 
 References:
 - Kulkarni et al., "Logical Physical Clocks and Consistent Snapshots in Globally Distributed Databases" (2014)

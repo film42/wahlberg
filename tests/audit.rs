@@ -1,17 +1,14 @@
 //! Audit scenarios: each test asserts the behavior the README promises (or
-//! that a hostile shared filesystem requires). Tests marked `#[ignore]`
-//! still FAIL and document a known open issue. Run them with:
-//!
-//!     cargo test --test audit -- --ignored
+//! that a hostile shared filesystem requires). Every one of these failed
+//! against the original implementation.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, TimeZone, Utc};
 use serde_json::Value;
 use tempfile::TempDir;
 use ulid::Ulid;
-use wahlberg::eavc::{Op, OpType};
+use wahlberg::eavc::{self, Op, OpType};
 use wahlberg::store::Store;
 use wahlberg::wal;
 
@@ -19,19 +16,19 @@ fn tmp() -> TempDir {
     tempfile::tempdir().unwrap()
 }
 
-fn ts(ms: i64) -> DateTime<Utc> {
-    Utc.timestamp_millis_opt(1_800_000_000_000 + ms).unwrap()
+/// A fresh tx at a fixed base time + `ms` (random tiebreak bits).
+fn tx(ms: u64) -> Ulid {
+    Ulid::from_parts(1_800_000_000_000 + ms, Ulid::new().random())
 }
 
-fn op_at(tbl: &str, id: &str, field: &str, value: Value, t: DateTime<Utc>) -> Op {
+fn op_at(tbl: &str, id: &str, field: &str, value: Value, tx: Ulid) -> Op {
     Op {
-        op_id: Ulid::new(),
+        tx,
         tbl: tbl.into(),
         id: id.into(),
         op: OpType::Update,
         field: field.into(),
         value,
-        ts: t,
         user: "u".into(),
     }
 }
@@ -90,7 +87,7 @@ fn flush_failure_keeps_pending_ops() {
 #[test]
 fn io_error_mid_sync_does_not_lose_earlier_files() {
     let dir = tmp();
-    write_ranked(dir.path(), 1, &[op_at("t", "1", "name", s("Alice"), ts(0))]);
+    write_ranked(dir.path(), 1, &[op_at("t", "1", "name", s("Alice"), tx(0))]);
     fs::create_dir(dir.path().join("00000002_s.wal")).unwrap();
 
     let mut store = Store::open(dir.path(), "r", "r");
@@ -111,13 +108,13 @@ fn io_error_mid_sync_does_not_lose_earlier_files() {
 #[test]
 fn invalid_utf8_file_does_not_wedge_sync_or_compaction() {
     let dir = tmp();
-    write_ranked(dir.path(), 1, &[op_at("t", "1", "name", s("Alice"), ts(0))]);
+    write_ranked(dir.path(), 1, &[op_at("t", "1", "name", s("Alice"), tx(0))]);
     fs::write(
         dir.path().join("00000002_x.wal"),
         b"\xff\xfe garbage from a bad disk\n",
     )
     .unwrap();
-    write_ranked(dir.path(), 3, &[op_at("t", "2", "name", s("Bob"), ts(1))]);
+    write_ranked(dir.path(), 3, &[op_at("t", "2", "name", s("Bob"), tx(1))]);
 
     let mut store = Store::open(dir.path(), "r", "r");
     assert!(
@@ -139,19 +136,19 @@ fn invalid_utf8_file_does_not_wedge_sync_or_compaction() {
 #[test]
 fn compaction_never_deletes_unreadable_files() {
     let dir = tmp();
-    write_ranked(dir.path(), 1, &[op_at("t", "1", "name", s("Alice"), ts(0))]);
+    write_ranked(dir.path(), 1, &[op_at("t", "1", "name", s("Alice"), tx(0))]);
 
     // A second writer's file that is only partially visible (truncated).
     let partial = write_ranked(
         dir.path(),
         2,
         &[
-            op_at("t", "2", "name", s("Bob"), ts(1)),
-            op_at("t", "2", "email", s("bob@x"), ts(1)),
+            op_at("t", "2", "name", s("Bob"), tx(1)),
+            op_at("t", "2", "email", s("bob@x"), tx(1)),
         ],
     );
     let full = fs::read_to_string(&partial).unwrap();
-    let cut = full.rfind("{\"opId\"").unwrap();
+    let cut = full.rfind("{\"tx\"").unwrap();
     fs::write(&partial, &full[..cut]).unwrap();
 
     wal::compact(dir.path(), "c").unwrap();
@@ -171,27 +168,45 @@ fn compaction_of_only_corrupt_files_deletes_nothing() {
 }
 
 // ---------------------------------------------------------------------------
-// 5. An older compactor rewrites newer-version files, stripping fields it
-//    doesn't know about (serde ignores unknown fields) and re-labelling v2.
+// 5. A compactor must not rewrite files of another version: parsing them
+//    with this build's schema silently drops or misreads fields.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn compaction_leaves_newer_version_files_alone() {
+fn compaction_leaves_other_version_files_alone() {
     let dir = tmp();
     let id = Ulid::new();
-    let v3 = format!(
-        "{{\"v\":3,\"t\":\"f\",\"n\":1,\"lo\":\"{id}\",\"hi\":\"{id}\"}}\n\
+    // A future v4 op with a field this build doesn't know.
+    let v4 = format!(
+        "{{\"v\":4,\"t\":\"f\",\"n\":1,\"lo\":\"{id}\",\"hi\":\"{id}\"}}\n\
          {{\"sid\":\"new\",\"user\":\"u\",\"at\":\"2027-01-01T00:00:00Z\"}}\n\
-         {{\"opId\":\"{id}\",\"tbl\":\"t\",\"id\":\"1\",\"op\":\"U\",\"field\":\"name\",\
-         \"value\":\"\\\"Alice\\\"\",\"ts\":\"2027-01-01T00:00:00Z\",\"user\":\"u\",\
-         \"hlc\":\"0001-0003-node\"}}\n"
+         {{\"tx\":\"{id}\",\"tbl\":\"t\",\"id\":\"1\",\"op\":\"U\",\"field\":\"name\",\
+         \"value\":\"\\\"Alice\\\"\",\"user\":\"u\",\"sig\":\"abc\"}}\n"
     );
-    let v3_path = dir.path().join("00000001_new.wal");
-    fs::write(&v3_path, v3).unwrap();
-    write_ranked(dir.path(), 2, &[op_at("t", "2", "name", s("Bob"), ts(0))]);
+    // An abandoned v2 op (separate opId + ts).
+    let v2 = format!(
+        "{{\"v\":2,\"t\":\"f\",\"n\":1,\"lo\":\"{id}\",\"hi\":\"{id}\"}}\n\
+         {{\"sid\":\"old\",\"user\":\"u\",\"at\":\"2026-01-01T00:00:00Z\"}}\n\
+         {{\"opId\":\"{id}\",\"tbl\":\"t\",\"id\":\"1\",\"op\":\"U\",\"field\":\"name\",\
+         \"value\":\"\\\"Alice\\\"\",\"ts\":\"2026-01-01T00:00:00.000Z\",\"user\":\"u\"}}\n"
+    );
+    let v4_path = dir.path().join("00000001_new.wal");
+    let v2_path = dir.path().join("00000002_old.wal");
+    fs::write(&v4_path, v4).unwrap();
+    fs::write(&v2_path, v2).unwrap();
+    write_ranked(dir.path(), 3, &[op_at("t", "2", "name", s("Bob"), tx(0))]);
 
-    wal::compact(dir.path(), "old").unwrap();
-    assert!(v3_path.exists(), "v2 compactor consumed a v3 file");
+    wal::compact(dir.path(), "c").unwrap();
+    assert!(v4_path.exists(), "compactor consumed a newer-version file");
+    assert!(v2_path.exists(), "compactor consumed an older-version file");
+
+    let mut r = Store::open(dir.path(), "r", "r");
+    r.sync().unwrap();
+    assert!(
+        r.get("t", "1").is_none(),
+        "other-version ops must not be read"
+    );
+    assert!(r.get("t", "2").is_some());
 }
 
 // ---------------------------------------------------------------------------
@@ -200,11 +215,11 @@ fn compaction_leaves_newer_version_files_alone() {
 
 #[test]
 fn purge_converges_regardless_of_file_order() {
-    let name = op_at("t", "1", "name", s("Alice"), ts(0));
-    let purge = op_at("t", "1", "_purge", Value::Bool(true), ts(1));
+    let name = op_at("t", "1", "name", s("Alice"), tx(0));
+    let purge = op_at("t", "1", "_purge", Value::Bool(true), tx(1));
     // Anyone can write this through Store::update — fields are freeform.
     // Purge is irreversible, so this must be ignored.
-    let unpurge = op_at("t", "1", "_purge", Value::Bool(false), ts(2));
+    let unpurge = op_at("t", "1", "_purge", Value::Bool(false), tx(2));
 
     let a = tmp();
     write_ranked(a.path(), 1, &[name.clone()]);
@@ -232,20 +247,19 @@ fn purge_converges_regardless_of_file_order() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "BUG: materialize_entity ignores the auto-restore rule from the README"]
 fn auto_restore_when_field_is_newer_than_delete() {
     let dir = tmp();
-    write_ranked(dir.path(), 1, &[op_at("t", "1", "name", s("Alice"), ts(0))]);
+    write_ranked(dir.path(), 1, &[op_at("t", "1", "name", s("Alice"), tx(0))]);
     write_ranked(
         dir.path(),
         2,
-        &[op_at("t", "1", "_deleted", Value::Bool(true), ts(1))],
+        &[op_at("t", "1", "_deleted", Value::Bool(true), tx(1))],
     );
-    // Offline user edits after the delete (by ts).
+    // Offline user edits after the delete (by tx).
     write_ranked(
         dir.path(),
         3,
-        &[op_at("t", "1", "name", s("Alicia"), ts(2))],
+        &[op_at("t", "1", "name", s("Alicia"), tx(2))],
     );
 
     let mut r = Store::open(dir.path(), "r", "r");
@@ -254,24 +268,31 @@ fn auto_restore_when_field_is_newer_than_delete() {
 }
 
 // ---------------------------------------------------------------------------
-// 8. Transactions tear on ts ties: the tiebreak is per-op random ULID, so
-//    two transactions with the same ts interleave field-by-field.
+// 8. Transactions must not tear when they land in the same millisecond. With a
+//    random tiebreak per op, two such transactions interleaved field-by-field;
+//    now every op in a transaction shares one tx.
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "BUG/DESIGN: per-op ULID tiebreak lets same-ts transactions interleave"]
-fn same_ts_transactions_do_not_tear() {
-    let t = ts(0);
+fn same_ms_transactions_do_not_tear() {
     let mut torn = 0;
     for _ in 0..200 {
-        let tx1 = [
-            op_at("t", "1", "a", s("x1"), t),
-            op_at("t", "1", "b", s("x1"), t),
-        ];
-        let tx2 = [
-            op_at("t", "1", "a", s("x2"), t),
-            op_at("t", "1", "b", s("x2"), t),
-        ];
+        let tx1 = eavc::transaction(
+            "t",
+            "1",
+            OpType::Update,
+            &[("a", s("x1")), ("b", s("x1"))],
+            tx(0),
+            "u1",
+        );
+        let tx2 = eavc::transaction(
+            "t",
+            "1",
+            OpType::Update,
+            &[("a", s("x2")), ("b", s("x2"))],
+            tx(0),
+            "u2",
+        );
         let dir = tmp();
         write_ranked(dir.path(), 1, &tx1);
         write_ranked(dir.path(), 2, &tx2);
@@ -289,25 +310,88 @@ fn same_ts_transactions_do_not_tear() {
 }
 
 // ---------------------------------------------------------------------------
-// 9. Wire `ts` is variable-width, so string comparison (which the README's
-//    "other language" pseudocode uses) disagrees with time order.
+// 9. `tx` on the wire: fixed-width Crockford base32, so string order ==
+//    ULID order == time order. Case must not matter.
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "PROTOCOL: ts serialization is variable precision; lexicographic order != time order"]
-fn wire_ts_sorts_lexicographically() {
-    let earlier = Utc.timestamp_opt(1_800_000_000, 0).unwrap(); // whole second
-    let later = Utc.timestamp_opt(1_800_000_000, 500_000_000).unwrap(); // +500ms
-    let a = op_at("t", "1", "f", Value::Null, earlier);
-    let b = op_at("t", "1", "f", Value::Null, later);
-    let ja: Value = serde_json::to_value(&a).unwrap();
-    let jb: Value = serde_json::to_value(&b).unwrap();
-    let (sa, sb) = (ja["ts"].as_str().unwrap(), jb["ts"].as_str().unwrap());
-    println!("earlier={sa} later={sb}");
-    assert!(
-        sa < sb,
-        "a JS reader comparing strings would pick the wrong winner"
+fn wire_tx_sorts_lexicographically_and_ignores_case() {
+    let earlier = op_at("t", "1", "f", Value::Null, tx(0));
+    let later = op_at("t", "1", "f", Value::Null, tx(500));
+    let ja = serde_json::to_value(&earlier).unwrap();
+    let jb = serde_json::to_value(&later).unwrap();
+    let (sa, sb) = (ja["tx"].as_str().unwrap(), jb["tx"].as_str().unwrap());
+    assert_eq!(sa.len(), 26);
+    assert!(sa < sb, "string order must match time order");
+
+    let mut lower = ja.clone();
+    lower["tx"] = Value::String(sa.to_lowercase());
+    let parsed: Op = serde_json::from_value(lower).unwrap();
+    assert_eq!(parsed.tx, earlier.tx, "a lowercase tx must compare equal");
+}
+
+#[test]
+fn ts_is_derived_from_tx() {
+    let op = op_at("t", "1", "f", Value::Null, tx(176));
+    assert_eq!(op.ts().timestamp_millis(), 1_800_000_000_176);
+    let wire = serde_json::to_value(&op).unwrap();
+    assert!(wire.get("ts").is_none() && wire.get("opId").is_none());
+}
+
+// ---------------------------------------------------------------------------
+// 9b. A local write must beat the state it was made against, even when the
+//     wall clock is behind (peer clock skew, NTP step back).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn local_write_beats_observed_state_despite_clock_skew() {
+    let dir = tmp();
+    // A peer whose clock is an hour ahead wrote this.
+    let future = Ulid::from_parts(Ulid::new().timestamp_ms() + 3_600_000, Ulid::new().random());
+    write_ranked(
+        dir.path(),
+        1,
+        &[op_at("t", "1", "name", s("Skewed"), future)],
     );
+
+    let mut st = Store::open(dir.path(), "me", "me");
+    st.sync().unwrap();
+    st.update("t", "1", &[("name", s("Mine"))]).unwrap();
+    assert_eq!(
+        st.get("t", "1").unwrap().fields["name"],
+        "Mine",
+        "edit didn't stick"
+    );
+
+    st.delete("t", "1").unwrap();
+    assert!(
+        st.get("t", "1").is_none(),
+        "delete was instantly auto-restored"
+    );
+
+    // And it replicates: a fresh reader agrees.
+    st.flush().unwrap();
+    let mut r = Store::open(dir.path(), "r", "r");
+    r.sync().unwrap();
+    assert!(r.get("t", "1").is_none());
+    assert_eq!(
+        r.get_including_deleted("t", "1").unwrap().fields["name"],
+        "Mine"
+    );
+}
+
+#[test]
+fn rapid_local_writes_never_tie() {
+    let dir = tmp();
+    let mut st = Store::open(dir.path(), "me", "me");
+    for i in 0..500 {
+        st.update("t", "1", &[("n", Value::from(i))]).unwrap();
+        assert_eq!(
+            st.get("t", "1").unwrap().fields["n"],
+            i,
+            "write {i} lost to an earlier one"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -315,7 +399,6 @@ fn wire_ts_sorts_lexicographically() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "BUG: wal-exporter upserts only; purged entities persist in the SQLite output"]
 fn exporter_honors_purge() {
     use std::process::Command;
     let build = Command::new("cargo")

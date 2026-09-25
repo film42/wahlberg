@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use serde_json::Value;
+use ulid::Ulid;
 
 use crate::eavc::Op;
 
@@ -17,8 +18,9 @@ pub fn is_purge(op: &Op) -> bool {
 
 /// Returns true if `new` beats `old` for the same (tbl, id, field).
 ///
-/// Plain LWW (higher ts, then higher op_id), with one exception: a purge
-/// tombstone beats any non-tombstone `_purge` value regardless of ts. That
+/// Plain LWW on `tx` (its ms timestamp, then its random bits), with one
+/// exception: a purge tombstone beats any non-tombstone `_purge` value
+/// regardless of tx. That
 /// makes purge irreversible, which is what lets the compactor strip purged
 /// fields without a partial view of the WAL ever losing data.
 pub fn wins(new: &Op, old: &Op) -> bool {
@@ -28,7 +30,7 @@ pub fn wins(new: &Op, old: &Op) -> bool {
             return n;
         }
     }
-    new.ts > old.ts || (new.ts == old.ts && new.op_id > old.op_id)
+    new.tx > old.tx
 }
 
 /// Order-independent merged state. The store and the compactor both use this,
@@ -66,6 +68,15 @@ impl MergeState {
         self.winners
             .get(&(tbl.to_string(), id.to_string(), PURGE.to_string()))
             .is_some_and(is_purge)
+    }
+
+    /// Highest tx among the winning facts of (tbl, id), if any.
+    pub fn entity_max_tx(&self, tbl: &str, id: &str) -> Option<Ulid> {
+        self.winners
+            .iter()
+            .filter(|((t, i, _), _)| t == tbl && i == id)
+            .map(|(_, op)| op.tx)
+            .max()
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&FieldKey, &Op)> {

@@ -4,14 +4,19 @@
 //! lots of ts ties), lays them out as WAL files, and checks invariants against
 //! an order-independent oracle that implements the README spec.
 //!
-//!     cargo test --release --test fuzz -- --ignored --nocapture
+//! Runs as part of `cargo test` (~4s, random seed each run). For a long soak:
+//!
+//!     FUZZ_ITERS=50000 cargo test --release --test fuzz -- --nocapture
+//!
+//! To replay a failure, use the seed from its message:
+//!
+//!     FUZZ_SEED=<seed> cargo test --test fuzz -- --nocapture
 //!
 //! Env knobs:
-//!   FUZZ_ITERS=N            iterations (default 2000)
-//!   FUZZ_SEED=N             base seed (default 1)
+//!   FUZZ_ITERS=N            iterations (default 400)
+//!   FUZZ_SEED=N             base seed (default: random per run)
 //!   FUZZ_UNPURGE=0          never generate `_purge=false`
-//!   FUZZ_AUTORESTORE=1      oracle applies the README auto-restore rule
-//!                           (off by default: not implemented yet)
+//!   FUZZ_AUTORESTORE=0      oracle ignores the README auto-restore rule
 //!   FUZZ_SYSTEM_VALUES=0    only generate `true` for `_deleted`/`_purge`
 //!
 //! Checks:
@@ -26,10 +31,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, TimeZone, Utc};
 use serde_json::Value;
 use ulid::Ulid;
-use wahlberg::eavc::{Op, OpType};
+use wahlberg::eavc::{self, Op, OpType};
 use wahlberg::store::Store;
 use wahlberg::wal;
 
@@ -91,9 +95,7 @@ const TABLES: &[&str] = &["t0", "t1"];
 const IDS: &[&str] = &["e0", "e1", "e2"];
 const FIELDS: &[&str] = &["a", "b", "_deleted", "_purge"];
 
-fn base_ts(ms: i64) -> DateTime<Utc> {
-    Utc.timestamp_millis_opt(1_800_000_000_000 + ms).unwrap()
-}
+const BASE_MS: u64 = 1_800_000_000_000;
 
 /// A case is a list of files; each file is a list of ops (one "flush").
 type Case = Vec<Vec<Op>>;
@@ -102,12 +104,14 @@ fn gen_case(rng: &mut Rng, cfg: Cfg) -> Case {
     let n_files = 1 + rng.below(8);
     let mut files = Vec::new();
     for _ in 0..n_files {
-        // A file holds 1..3 transactions; each tx shares a ts and an entity.
+        // A file holds 1..3 transactions; each shares one tx and an entity.
+        // tx times span only 6ms, so same-ms ties are common.
         let mut ops = Vec::new();
         for _ in 0..1 + rng.below(3) {
             let tbl = TABLES[rng.below(TABLES.len())];
             let id = IDS[rng.below(IDS.len())];
-            let t = base_ts(rng.below(6) as i64);
+            let tx = Ulid::from_parts(BASE_MS + rng.below(6) as u64, rng.next() as u128);
+            let mut fields = Vec::new();
             for _ in 0..1 + rng.below(3) {
                 let field = FIELDS[rng.below(FIELDS.len())];
                 let value = if field.starts_with('_') {
@@ -116,17 +120,16 @@ fn gen_case(rng: &mut Rng, cfg: Cfg) -> Case {
                 } else {
                     Value::String(format!("v{}", rng.below(4)))
                 };
-                ops.push(Op {
-                    op_id: Ulid::new(),
-                    tbl: tbl.into(),
-                    id: id.into(),
-                    op: OpType::Update,
-                    field: field.into(),
-                    value,
-                    ts: t,
-                    user: "fuzz".into(),
-                });
+                fields.push((field, value));
             }
+            ops.extend(eavc::transaction(
+                tbl,
+                id,
+                OpType::Update,
+                &fields,
+                tx,
+                "fuzz",
+            ));
         }
         files.push(ops);
     }
@@ -145,9 +148,7 @@ fn oracle(case: &Case, cfg: Cfg) -> View {
     let mut winners: HashMap<(String, String, String), &Op> = HashMap::new();
     for op in case.iter().flatten() {
         let k = (op.tbl.clone(), op.id.clone(), op.field.clone());
-        let replace = winners.get(&k).map_or(true, |e| {
-            op.ts > e.ts || (op.ts == e.ts && op.op_id > e.op_id)
-        });
+        let replace = winners.get(&k).is_none_or(|e| op.tx > e.tx);
         if replace {
             winners.insert(k, op);
         }
@@ -167,16 +168,16 @@ fn oracle(case: &Case, cfg: Cfg) -> View {
                 continue;
             }
             let mut fields = BTreeMap::new();
-            let mut newest_field_ts = None;
+            let mut newest_field_tx = None;
             for f in FIELDS.iter().filter(|f| !f.starts_with('_')) {
                 if let Some(o) = get(f) {
                     fields.insert(f.to_string(), o.value.to_string());
-                    newest_field_ts = newest_field_ts.max(Some(o.ts));
+                    newest_field_tx = newest_field_tx.max(Some(o.tx));
                 }
             }
             let deleted = match get("_deleted") {
                 Some(d) if d.value == Value::Bool(true) => {
-                    !(cfg.autorestore && newest_field_ts.is_some_and(|t| t > d.ts))
+                    !(cfg.autorestore && newest_field_tx.is_some_and(|t| t > d.tx))
                 }
                 _ => false,
             };
@@ -385,27 +386,30 @@ fn print_case(case: &Case) {
         println!("    file {fi}:");
         for o in f {
             println!(
-                "      {}/{}.{} = {}  @ts+{}ms  op={}",
+                "      {}/{}.{} = {}  @+{}ms  tx=..{}",
                 o.tbl,
                 o.id,
                 o.field,
                 o.value,
-                o.ts.timestamp_millis() - 1_800_000_000_000,
-                &o.op_id.to_string()[20..],
+                o.tx.timestamp_ms() - BASE_MS,
+                &o.tx.to_string()[20..],
             );
         }
     }
 }
 
 #[test]
-#[ignore = "fuzzer; run explicitly"]
 fn fuzz_consistency() {
     wal::set_fsync(false);
-    let iters = env_u64("FUZZ_ITERS", 2000);
-    let seed = env_u64("FUZZ_SEED", 1);
+    let iters = env_u64("FUZZ_ITERS", 400);
+    let random_seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+    let seed = env_u64("FUZZ_SEED", random_seed);
     let cfg = Cfg {
         unpurge: env_flag("FUZZ_UNPURGE", true),
-        autorestore: env_flag("FUZZ_AUTORESTORE", false),
+        autorestore: env_flag("FUZZ_AUTORESTORE", true),
         system_values: env_flag("FUZZ_SYSTEM_VALUES", true),
     };
     println!(
@@ -450,5 +454,9 @@ fn fuzz_consistency() {
         "\nfuzz done: {iters} iters, failures by check: {:?}",
         counts
     );
-    assert!(counts.is_empty(), "consistency violations: {:?}", counts);
+    assert!(
+        counts.is_empty(),
+        "consistency violations: {:?}; replay with FUZZ_SEED={seed}",
+        counts
+    );
 }
