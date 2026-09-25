@@ -1,0 +1,5 @@
+error: #[derive(Record)] needs the same name for serialize and deserialize; use `rename = "..."`
+ --> tests/ui/fail_split_rename.rs:6:13
+  |
+6 |     #[serde(rename(serialize = "a", deserialize = "b"))]
+  |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

@@ -1,0 +1,5 @@
+error: no id field: mark one with #[record(id)] or name it `id`
+ --> tests/ui/fail_no_id.rs:5:8
+  |
+5 | struct User {
+  |        ^^^^

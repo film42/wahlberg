@@ -286,9 +286,47 @@ let all_contacts = store.list("contacts");
 let tables = store.tables();
 ```
 
+### Typed Records
+
+Derive `Record` on a serde struct to get a typed table instead of field tuples (the `derive` feature, on by default):
+
+```rust
+use serde::{Deserialize, Serialize};
+use wahlberg::Record;
+
+#[derive(Serialize, Deserialize, Record)]
+#[record(table = "contacts")]   // default: the struct name in snake_case
+struct Contact {
+    id: String,                 // or mark another field with #[record(id)]
+    name: String,
+    email: String,
+    #[serde(default)]           // fields added later just work
+    phone: Option<String>,
+}
+
+let mut contacts = store.table::<Contact>();
+contacts.insert(&contact)?;                                    // new record: writes every field
+let c: Option<Contact> = contacts.get("c-1")?;
+let all: Vec<Contact> = contacts.list()?;
+contacts.update("c-1", |c| c.email = "new@example.com".into())?; // writes only `email`
+contacts.delete("c-1")?;
+contacts.purge("c-1")?;
+```
+
+- **Each serde key is one field.** Nested structs and `Vec`s are stored as a single field. serde attributes (`rename`, `rename_all`, `default`, `skip_serializing_if`) apply as usual.
+- **`update` writes only the fields that changed.** Two teammates editing different fields of the same record both keep their edits. Whole-record saves are intentionally not offered, because they would overwrite a teammate's concurrent edit with a stale value.
+- **The id is the entity id, not a stored field.** It must be string-like (`AsRef<str>`) and can't be changed by `update`.
+- **Reading is fallible.** If stored data doesn't fit the struct (another client wrote a different type), `get` returns an error naming the record instead of panicking. Fields the struct doesn't know about are ignored and left untouched.
+- **Rules:** `insert` fails if the id is live or purged. Inserting over a soft-deleted id brings it back. Field names starting with `_` are reserved.
+
+`Record` is a small trait (`TABLE`, `ID_FIELD`, `id()`), so you can implement it by hand without the derive.
+
 ### Examples
 
 ```bash
+# Typed records: two teammates edit the same contact concurrently
+cargo run --example records
+
 # Export WAL to SQLite (rebuilds the output to mirror current state;
 # purged data is removed and overwritten via PRAGMA secure_delete)
 cargo run --example wal-exporter -- --wal-dir ./wal --output-db ./out.db

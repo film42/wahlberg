@@ -1,0 +1,5 @@
+error: #[derive(Record)] only supports structs with named fields
+ --> tests/ui/fail_enum.rs:5:6
+  |
+5 | enum Status {
+  |      ^^^^^^

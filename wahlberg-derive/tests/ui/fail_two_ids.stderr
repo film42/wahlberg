@@ -1,0 +1,6 @@
+error: only one field can be #[record(id)]
+ --> tests/ui/fail_two_ids.rs:8:5
+  |
+8 | /     #[record(id)]
+9 | |     b: String,
+  | |_____________^

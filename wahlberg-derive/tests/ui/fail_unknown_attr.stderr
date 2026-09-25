@@ -1,0 +1,5 @@
+error: unsupported #[record] attribute; expected `table = "..."`
+ --> tests/ui/fail_unknown_attr.rs:5:10
+  |
+5 | #[record(tabel = "users")]
+  |          ^^^^^

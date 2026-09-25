@@ -125,6 +125,11 @@ impl Store {
             .filter(|e| !e.deleted && !e.purged)
     }
 
+    /// True if the entity has been purged. Purged ids can never be written again.
+    pub fn is_purged(&self, tbl: &str, id: &str) -> bool {
+        self.current.is_purged(tbl, id)
+    }
+
     /// Get a single entity even if soft-deleted. Purged entities are gone.
     pub fn get_including_deleted(&self, tbl: &str, id: &str) -> Option<Entity> {
         self.materialize_entity(tbl, id).filter(|e| !e.purged)
@@ -243,7 +248,7 @@ impl Store {
         })
     }
 
-    fn list_entity_ids(&self, tbl: &str) -> Vec<String> {
+    pub(crate) fn list_entity_ids(&self, tbl: &str) -> Vec<String> {
         let mut ids: Vec<String> = self
             .current
             .iter()
