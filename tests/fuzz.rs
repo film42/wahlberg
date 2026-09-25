@@ -27,43 +27,18 @@
 //!   arrival     a file is only partially visible during compaction, then
 //!               fully arrives → fresh reader == oracle (no lost writes)
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+mod common;
+
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use common::{EntityKey, Rng, View, diff, env_flag, env_u64, random_seed, store_view};
 use serde_json::Value;
 use ulid::Ulid;
 use walburg::eavc::{self, Op, OpType};
 use walburg::store::Store;
 use walburg::wal;
-
-// ---------------------------------------------------------------------------
-// rng
-// ---------------------------------------------------------------------------
-
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
-        z ^ (z >> 31)
-    }
-    fn below(&mut self, n: usize) -> usize {
-        (self.next() % n as u64) as usize
-    }
-    fn chance(&mut self, pct: u64) -> bool {
-        self.next() % 100 < pct
-    }
-    fn shuffle<T>(&mut self, v: &mut [T]) {
-        for i in (1..v.len()).rev() {
-            let j = self.below(i + 1);
-            v.swap(i, j);
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // config
@@ -74,17 +49,6 @@ struct Cfg {
     unpurge: bool,
     autorestore: bool,
     system_values: bool,
-}
-
-fn env_flag(name: &str, default: bool) -> bool {
-    std::env::var(name).map(|v| v != "0").unwrap_or(default)
-}
-
-fn env_u64(name: &str, default: u64) -> u64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
 }
 
 // ---------------------------------------------------------------------------
@@ -99,6 +63,17 @@ const BASE_MS: u64 = 1_800_000_000_000;
 
 /// A case is a list of files; each file is a list of ops (one "flush").
 type Case = Vec<Vec<Op>>;
+
+fn entities() -> Vec<EntityKey> {
+    TABLES
+        .iter()
+        .flat_map(|t| IDS.iter().map(move |i| (t.to_string(), i.to_string())))
+        .collect()
+}
+
+fn oracle(case: &Case, cfg: Cfg) -> View {
+    common::oracle(case.iter().flatten(), &entities(), cfg.autorestore)
+}
 
 fn gen_case(rng: &mut Rng, cfg: Cfg) -> Case {
     let n_files = 1 + rng.below(8);
@@ -137,82 +112,13 @@ fn gen_case(rng: &mut Rng, cfg: Cfg) -> Case {
 }
 
 // ---------------------------------------------------------------------------
-// oracle: order-independent spec model
-// ---------------------------------------------------------------------------
-
-type EntityKey = (String, String);
-/// None = invisible (never existed or purged). Some((deleted, fields)).
-type View = BTreeMap<EntityKey, Option<(bool, BTreeMap<String, String>)>>;
-
-fn oracle(case: &Case, cfg: Cfg) -> View {
-    let mut winners: HashMap<(String, String, String), &Op> = HashMap::new();
-    for op in case.iter().flatten() {
-        let k = (op.tbl.clone(), op.id.clone(), op.field.clone());
-        let replace = winners.get(&k).is_none_or(|e| op.tx > e.tx);
-        if replace {
-            winners.insert(k, op);
-        }
-    }
-
-    let mut view = View::new();
-    for t in TABLES {
-        for i in IDS {
-            let get = |f: &str| winners.get(&(t.to_string(), i.to_string(), f.to_string()));
-            let exists = FIELDS.iter().any(|f| get(f).is_some());
-            // Purge is irreversible: any `_purge=true` ever written wins.
-            let purged = case.iter().flatten().any(|o| {
-                o.tbl == *t && o.id == *i && o.field == "_purge" && o.value == Value::Bool(true)
-            });
-            if !exists || purged {
-                view.insert((t.to_string(), i.to_string()), None);
-                continue;
-            }
-            let mut fields = BTreeMap::new();
-            let mut newest_field_tx = None;
-            for f in FIELDS.iter().filter(|f| !f.starts_with('_')) {
-                if let Some(o) = get(f) {
-                    fields.insert(f.to_string(), o.value.to_string());
-                    newest_field_tx = newest_field_tx.max(Some(o.tx));
-                }
-            }
-            let deleted = match get("_deleted") {
-                Some(d) if d.value == Value::Bool(true) => {
-                    !(cfg.autorestore && newest_field_tx.is_some_and(|t| t > d.tx))
-                }
-                _ => false,
-            };
-            view.insert((t.to_string(), i.to_string()), Some((deleted, fields)));
-        }
-    }
-    view
-}
-
-// ---------------------------------------------------------------------------
 // harness
 // ---------------------------------------------------------------------------
-
-fn store_view(store: &Store) -> View {
-    let mut view = View::new();
-    for t in TABLES {
-        for i in IDS {
-            let v = store.get_including_deleted(t, i).map(|e| {
-                let fields = e
-                    .fields
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.to_string()))
-                    .collect();
-                (e.deleted, fields)
-            });
-            view.insert((t.to_string(), i.to_string()), v);
-        }
-    }
-    view
-}
 
 fn fresh_view(dir: &Path) -> View {
     let mut s = Store::open(dir, "reader", "reader");
     s.sync().expect("sync failed");
-    store_view(&s)
+    store_view(&s, &entities())
 }
 
 /// Writes each file with a rank-based name so directory order == `order`.
@@ -248,17 +154,6 @@ fn partial_compact(dir: &Path, rng: &mut Rng) {
         fs::rename(&f, dir.join(f.file_name().unwrap())).unwrap();
     }
     fs::remove_dir(&side).unwrap();
-}
-
-fn diff(a: &View, b: &View) -> String {
-    let mut out = String::new();
-    for (k, va) in a {
-        let vb = &b[k];
-        if va != vb {
-            out.push_str(&format!("    {}/{}: {:?}  vs  {:?}\n", k.0, k.1, va, vb));
-        }
-    }
-    out
 }
 
 /// Runs every check on a case. Returns (check name, detail) for each failure.
@@ -316,7 +211,7 @@ fn run_case(case: &Case, plan_seed: u64, cfg: Cfg) -> Vec<(&'static str, String)
         fails.push(("compaction", diff(&expected, &after_oracle_on_disk)));
     }
     early.sync().unwrap();
-    let inc = store_view(&early);
+    let inc = store_view(&early, &entities());
     if inc != after {
         fails.push(("incremental", diff(&after, &inc)));
     }
@@ -402,11 +297,7 @@ fn print_case(case: &Case) {
 fn fuzz_consistency() {
     wal::set_fsync(false);
     let iters = env_u64("FUZZ_ITERS", 400);
-    let random_seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64;
-    let seed = env_u64("FUZZ_SEED", random_seed);
+    let seed = env_u64("FUZZ_SEED", random_seed());
     let cfg = Cfg {
         unpurge: env_flag("FUZZ_UNPURGE", true),
         autorestore: env_flag("FUZZ_AUTORESTORE", true),

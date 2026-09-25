@@ -143,17 +143,26 @@ impl<T: Record> Table<'_, T> {
             .collect()
     }
 
-    /// All live records, sorted by id. Fails on the first record that
-    /// doesn't fit `T`; use [`Table::ids`] + [`Table::get`] to handle those
-    /// one by one.
-    pub fn list(&self) -> Result<Vec<T>, RecordError> {
-        let mut out = Vec::new();
-        for id in self.ids() {
-            if let Some(record) = self.get(&id)? {
-                out.push(record);
-            }
-        }
-        Ok(out)
+    /// All live records that decode as `T`, sorted by id.
+    ///
+    /// Records that don't decode are skipped. That's normal for a moment
+    /// when files arrive out of order (e.g. a record's update has landed but
+    /// the file with its insert hasn't yet); a record that stays invalid
+    /// usually means another client wrote an incompatible shape. See
+    /// [`Table::invalid`].
+    pub fn list(&self) -> Vec<T> {
+        self.ids()
+            .iter()
+            .filter_map(|id| self.get(id).ok().flatten())
+            .collect()
+    }
+
+    /// Live records that currently fail to decode as `T`, with the reason.
+    pub fn invalid(&self) -> Vec<RecordError> {
+        self.ids()
+            .iter()
+            .filter_map(|id| self.get(id).err())
+            .collect()
     }
 
     /// Loads the record, applies `change`, and writes only the fields whose

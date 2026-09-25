@@ -39,7 +39,12 @@ pub struct Store {
     outbox: Vec<Op>,
     /// tx of the last transaction this session wrote.
     last_tx: Option<Ulid>,
+    /// Where fresh tx values come from. `None` = `Ulid::new()`.
+    tx_source: Option<TxSource>,
 }
+
+/// Supplies fresh ULIDs for new transactions. See [`Store::set_tx_source`].
+pub type TxSource = Box<dyn FnMut() -> Ulid + Send>;
 
 impl Store {
     /// Open or create a store backed by the given WAL directory.
@@ -54,6 +59,7 @@ impl Store {
             current: MergeState::default(),
             outbox: Vec::new(),
             last_tx: None,
+            tx_source: None,
         }
     }
 
@@ -155,13 +161,21 @@ impl Store {
     pub fn tables(&self) -> Vec<String> {
         let mut tables: Vec<String> = self
             .current
-            .iter()
-            .map(|((t, _, _), _)| t.clone())
+            .entity_keys()
+            .map(|(t, _)| t.to_string())
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
             .collect();
         tables.sort();
         tables
+    }
+
+    /// Replaces the source of fresh tx values (default: `Ulid::new()`, i.e.
+    /// the wall clock plus randomness). For deterministic simulation and
+    /// tests, e.g. a seeded or deliberately skewed clock. The "strictly
+    /// greater than what this session has seen" rule still applies on top.
+    pub fn set_tx_source(&mut self, source: impl FnMut() -> Ulid + Send + 'static) {
+        self.tx_source = Some(Box::new(source));
     }
 
     /// Number of pending ops not yet flushed to disk.
@@ -173,27 +187,26 @@ impl Store {
 
     /// Records one transaction: applies it locally and queues it for flush.
     fn write(&mut self, tbl: &str, id: &str, op: OpType, fields: &[(&str, Value)]) {
-        let tx = self.next_tx(tbl, id);
+        let tx = self.next_tx();
         for op in eavc::transaction(tbl, id, op, fields, tx, &self.user) {
             self.apply_op(&op);
             self.outbox.push(op);
         }
     }
 
-    /// Picks the tx for a new transaction on (tbl, id): a fresh ULID, but
-    /// strictly greater than anything this session has written and anything
-    /// it has seen on the entity. So a write always beats the state it was
-    /// made against — even if the wall clock stepped back, or a peer's clock
-    /// runs ahead. When the fresh ULID isn't ahead, we increment the floor's
-    /// random part, so the embedded time only runs ahead of the wall clock
-    /// when the floor itself was ahead.
-    fn next_tx(&mut self, tbl: &str, id: &str) -> Ulid {
-        let fresh = Ulid::new();
-        let floor = self.current.entity_max_tx(tbl, id).max(self.last_tx);
-        let tx = match floor {
-            Some(f) if fresh <= f => f
+    /// Picks the tx for a new transaction: standard monotonic ULID
+    /// generation, per session. Each new millisecond starts from a fresh
+    /// random ULID; another transaction in the same millisecond (or after the
+    /// clock stepped back) is this session's own previous tx + 1, so its
+    /// writes always sort in the order it made them. Other writers' values
+    /// are never used, so there's no cross-session coupling (and clock skew
+    /// between machines is an accepted v3 limitation).
+    fn next_tx(&mut self) -> Ulid {
+        let fresh = self.tx_source.as_mut().map_or_else(Ulid::new, |f| f());
+        let tx = match self.last_tx {
+            Some(last) if fresh.timestamp_ms() <= last.timestamp_ms() => last
                 .increment()
-                .unwrap_or_else(|| Ulid::from_parts(f.timestamp_ms() + 1, fresh.random())),
+                .unwrap_or_else(|| Ulid::from_parts(last.timestamp_ms() + 1, fresh.random())),
             _ => fresh,
         };
         self.last_tx = Some(tx);
@@ -205,30 +218,23 @@ impl Store {
     }
 
     fn materialize_entity(&self, tbl: &str, id: &str) -> Option<Entity> {
+        let facts = self.current.entity(tbl, id)?;
         let mut fields = HashMap::new();
-        let mut found = false;
         let mut deleted_at = None;
         let mut newest_field = None;
         let mut purged = false;
 
-        for ((t, eid, field), op) in self.current.iter() {
-            if t == tbl && eid == id {
-                found = true;
-                if field == PURGE {
-                    purged |= op.value == Value::Bool(true);
-                } else if field == DELETED {
-                    if op.value == Value::Bool(true) {
-                        deleted_at = Some(op.tx);
-                    }
-                } else if !field.starts_with('_') {
-                    fields.insert(field.clone(), op.value.clone());
-                    newest_field = newest_field.max(Some(op.tx));
+        for (field, op) in facts {
+            if field == PURGE {
+                purged |= op.value == Value::Bool(true);
+            } else if field == DELETED {
+                if op.value == Value::Bool(true) {
+                    deleted_at = Some(op.tx);
                 }
+            } else if !field.starts_with('_') {
+                fields.insert(field.clone(), op.value.clone());
+                newest_field = newest_field.max(Some(op.tx));
             }
-        }
-
-        if !found {
-            return None;
         }
 
         // Auto-restore: a field written after the delete means someone was
@@ -251,11 +257,9 @@ impl Store {
     pub(crate) fn list_entity_ids(&self, tbl: &str) -> Vec<String> {
         let mut ids: Vec<String> = self
             .current
-            .iter()
-            .filter(|((t, _, _), _)| t == tbl)
-            .map(|((_, id, _), _)| id.clone())
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
+            .entity_keys()
+            .filter(|(t, _)| *t == tbl)
+            .map(|(_, id)| id.to_string())
             .collect();
         ids.sort();
         ids

@@ -204,7 +204,7 @@ fn list_and_ids_skip_deleted() {
     users.delete("u-2").unwrap();
 
     assert_eq!(users.ids(), vec!["u-1", "u-3"]);
-    let ids: Vec<String> = users.list().unwrap().into_iter().map(|u| u.id).collect();
+    let ids: Vec<String> = users.list().into_iter().map(|u| u.id).collect();
     assert_eq!(ids, vec!["u-1", "u-3"]);
 }
 
@@ -255,7 +255,12 @@ fn mismatched_stored_data_is_an_error_not_a_panic() {
     let err = store.table::<User>().get("u-9").unwrap_err();
     assert!(matches!(err, RecordError::Serde { .. }));
     assert!(err.to_string().contains("users/u-9"), "{err}");
-    assert!(store.table::<User>().list().is_err());
+    assert!(store.table::<User>().list().is_empty(), "list skips it");
+    assert_eq!(
+        store.table::<User>().invalid().len(),
+        1,
+        "invalid reports it"
+    );
     assert_eq!(store.table::<User>().ids(), vec!["u-9"]);
 }
 
@@ -399,4 +404,41 @@ fn hand_written_impl_works_without_the_derive() {
         store.table::<Tag>().get("urgent").unwrap().unwrap().color,
         "red"
     );
+}
+
+#[test]
+fn update_arriving_before_insert_is_skipped_until_complete() {
+    // Sync folders deliver files out of order: here Bob's update of a record
+    // lands before Alice's insert of it.
+    let alice_dir = tmp();
+    let mut a = Store::open(alice_dir.path(), "a", "alice");
+    a.table::<User>().insert(&alice()).unwrap();
+    let insert_file = a.flush().unwrap().unwrap();
+    a.table::<User>()
+        .update("u-1", |u| u.email = "late@example.com".into())
+        .unwrap();
+    let update_file = a.flush().unwrap().unwrap();
+
+    let share = tmp();
+    std::fs::copy(
+        &update_file,
+        share.path().join(update_file.file_name().unwrap()),
+    )
+    .unwrap();
+    let mut c = Store::open(share.path(), "c", "carol");
+    c.sync().unwrap();
+    let users = c.table::<User>();
+    assert!(users.list().is_empty(), "incomplete record must not appear");
+    assert_eq!(users.invalid().len(), 1);
+    assert!(users.get("u-1").is_err(), "get is strict");
+
+    std::fs::copy(
+        &insert_file,
+        share.path().join(insert_file.file_name().unwrap()),
+    )
+    .unwrap();
+    c.sync().unwrap();
+    let users = c.table::<User>();
+    assert_eq!(users.list().len(), 1);
+    assert_eq!(users.get("u-1").unwrap().unwrap().email, "late@example.com");
 }

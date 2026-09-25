@@ -85,7 +85,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         phone: None,
         tags: vec![],
     })?;
-    let names: Vec<String> = contacts.list()?.into_iter().map(|c| c.name).collect();
+    let names: Vec<String> = contacts.list().into_iter().map(|c| c.name).collect();
     println!("bob:   contacts = {names:?}");
 
     contacts.delete("c-2")?;

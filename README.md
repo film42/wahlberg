@@ -135,6 +135,8 @@ Every `(tbl, id, field)` tuple has exactly one winning value at any point in tim
 
 **Higher `tx` wins.** Because a ULID's timestamp is its most significant part, this means the later transaction wins; within the same millisecond, the random bits decide deterministically. The one exception is `_purge` (see [Tombstones](#tombstones)).
 
+Correct writers never produce two different transactions with the same `tx`. If it happens anyway (a buggy or foreign writer), the tie MUST still resolve identically everywhere: compare the value's canonical JSON, then `user`, and the higher wins. This keeps replicas convergent no matter what.
+
 This means:
 - Two users editing **different fields** on the same entity: both writes survive. No conflict.
 - Two users editing the **same field** at the same time: the later `tx` wins. Deterministic, no coordination needed.
@@ -187,9 +189,14 @@ A shared `tx` means transactions never tear. Two transactions that land in the s
 
 ### Choosing `tx`
 
-A writer SHOULD generate a fresh ULID for `tx`, but it MUST be strictly greater than (a) the last `tx` it wrote and (b) every `tx` it has seen on the target entity. If the fresh ULID isn't greater, increment the largest of those by one instead (monotonic ULID increment).
+Each writer (session) generates `tx` values with a **monotonic ULID generator**, the standard mode from the ULID spec:
 
-This guarantees that a write always beats the state it was made against. Rapid edits never tie. An edit or delete made after syncing a write from a peer whose clock runs ahead still sticks, instead of silently losing. And a delete is never instantly undone by auto-restore. Because the floor is bumped by incrementing its random bits, the embedded time only runs ahead of the wall clock when the floor itself was ahead. In effect, `tx` behaves like a hybrid logical clock.
+- In a new millisecond, generate a fresh ULID: current time plus 80 random bits.
+- For another transaction in the same millisecond (or if the clock stepped backwards), use the writer's **own** previous `tx` + 1.
+
+This keeps a writer's own transactions in the order it made them, even several in one millisecond. Writers MUST NOT derive a `tx` from another writer's values: two writers incrementing the same value would produce the same `tx`.
+
+Plain LWW then decides between writers. Clock skew between machines is an accepted limitation of v3 (see [Design Assumptions](#design-assumptions)).
 
 ## Replication
 
@@ -307,7 +314,7 @@ struct Contact {
 let mut contacts = store.table::<Contact>();
 contacts.insert(&contact)?;                                    // new record: writes every field
 let c: Option<Contact> = contacts.get("c-1")?;
-let all: Vec<Contact> = contacts.list()?;
+let all: Vec<Contact> = contacts.list();
 contacts.update("c-1", |c| c.email = "new@example.com".into())?; // writes only `email`
 contacts.delete("c-1")?;
 contacts.purge("c-1")?;
@@ -316,7 +323,7 @@ contacts.purge("c-1")?;
 - **Each serde key is one field.** Nested structs and `Vec`s are stored as a single field. serde attributes (`rename`, `rename_all`, `default`, `skip_serializing_if`) apply as usual.
 - **`update` writes only the fields that changed.** Two teammates editing different fields of the same record both keep their edits. Whole-record saves are intentionally not offered, because they would overwrite a teammate's concurrent edit with a stale value.
 - **The id is the entity id, not a stored field.** It must be string-like (`AsRef<str>`) and can't be changed by `update`.
-- **Reading is fallible.** If stored data doesn't fit the struct (another client wrote a different type), `get` returns an error naming the record instead of panicking. Fields the struct doesn't know about are ignored and left untouched.
+- **Incomplete or mismatched records don't break reads.** If stored data doesn't fit the struct, `get` returns an error naming the record, and `list` skips it (`invalid()` lists what was skipped and why). That's normal for a moment when files arrive out of order, such as an update landing before the insert on a sync folder. A record that stays invalid means another client wrote a different shape. Fields the struct doesn't know about are ignored and left untouched.
 - **Rules:** `insert` fails if the id is live or purged. Inserting over a soft-deleted id brings it back. Field names starting with `_` are reserved.
 
 `Record` is a small trait (`TABLE`, `ID_FIELD`, `id()`), so you can implement it by hand without the derive.
@@ -340,7 +347,7 @@ cargo run --example wal-tail -- --wal-dir ./wal -f
 
 To implement a compatible reader/writer, you need:
 
-1. **ULID generation** — with monotonic increment support (for [Choosing `tx`](#choosing-tx)). Libraries exist for every major language.
+1. **Monotonic ULID generation** (see [Choosing `tx`](#choosing-tx)). Libraries exist for every major language, e.g. `ulid::Generator` in Rust and `monotonicFactory()` in JS.
 2. **NDJSON parsing** — read one JSON object per line.
 3. **A `HashMap<(tbl, id, field), Fact>` for materialized state** — where `Fact` holds `{value, tx}`. On each op, compare with the existing fact using LWW rules and keep the winner.
 4. **Atomic file writes** — write to tmp, rename to final.
@@ -408,7 +415,7 @@ function consume(wal_dir, processed_set):
 
 ## Design Assumptions
 
-- **Clocks are reasonably synchronized.** LWW depends on timestamps being "close enough" (NTP-level). A machine with a clock 5 minutes ahead will win conflicts against *concurrent* writes. Writes made after syncing its data still win, because of the rule in [Choosing `tx`](#choosing-tx). This is acceptable for small teams on real computers; not suitable for adversarial or high-clock-skew environments.
+- **Clocks are reasonably synchronized.** LWW depends on timestamps being "close enough" (NTP-level). This is a known limitation of v3: a machine with a clock 5 minutes ahead silently wins every conflict for those 5 minutes, even against an edit someone made after seeing its write. A delete made against such a write can likewise be undone by auto-restore. This is acceptable for small teams on real computers; not suitable for adversarial or high-clock-skew environments. See [Hybrid Logical Clocks](#hybrid-logical-clocks-hlc) for the planned fix.
 - **Writers are trusted.** Any writer can write any field to any table. There is no schema enforcement at the protocol level. Validation belongs in the application layer.
 - **The shared directory is durable.** The protocol assumes files, once committed, are not silently corrupted or truncated by the filesystem. It handles missing files (compaction may remove them) and corrupt files (header validation) gracefully.
 
@@ -416,9 +423,11 @@ function consume(wal_dir, processed_set):
 
 ### Hybrid Logical Clocks (HLC)
 
-[Choosing `tx`](#choosing-tx) already gives the main HLC guarantee: if peer A writes, and peer B syncs and then writes the same entity, B's write wins even if B's wall clock is behind. It does this with no extra wire fields.
+Fixes the clock-skew limitation above: a write made after seeing another write should always win, whatever the two machines' clocks say.
 
-A full HLC would extend that from "the entity you wrote" to "everything you've synced" (advance the local clock on every remote op, not just on the target entity's). It has the same tradeoff as any HLC: one machine with a badly wrong clock drags everyone's `tx` forward. That's worth doing only if cross-entity causality starts to matter.
+The idea fits inside the existing `tx` field. When choosing a `tx`, a writer also requires it to be greater than every `tx` it has already seen (on the entity, or on everything it has synced), not just its own previous one. Causally later writes then always sort later, with no new wire fields.
+
+One pitfall to design around: when the local clock is behind what was seen, the new `tx` has to be built above the seen value. It must be drawn at random above it, never computed as "seen + 1". Otherwise two writers behind the same value pick the same `tx`. (An early prototype made exactly this mistake, and the lifecycle simulation caught it.) An HLC also inherits the usual tradeoff: one machine with a badly wrong clock drags everyone's `tx` forward.
 
 References:
 - Kulkarni et al., "Logical Physical Clocks and Consistent Snapshots in Globally Distributed Databases" (2014)
