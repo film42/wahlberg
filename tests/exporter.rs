@@ -10,7 +10,7 @@ fn exporter_bin() -> std::path::PathBuf {
     path.pop();
     path.pop();
     path.push("examples");
-    path.push("wal-exporter");
+    path.push(format!("wal-exporter{}", std::env::consts::EXE_SUFFIX));
     path
 }
 

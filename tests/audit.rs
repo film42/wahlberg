@@ -414,7 +414,7 @@ fn exporter_honors_purge() {
     bin.pop();
     bin.pop();
     bin.push("examples");
-    bin.push("wal-exporter");
+    bin.push(format!("wal-exporter{}", std::env::consts::EXE_SUFFIX));
 
     let wal_dir = tmp();
     let db_dir = tmp();
