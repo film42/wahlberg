@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use clap::Parser;
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use wahlberg::store::Store;
 
 #[derive(Parser)]
@@ -20,7 +20,10 @@ fn main() {
     let args = Args::parse();
 
     if !args.wal_dir.exists() {
-        eprintln!("error: WAL directory does not exist: {}", args.wal_dir.display());
+        eprintln!(
+            "error: WAL directory does not exist: {}",
+            args.wal_dir.display()
+        );
         std::process::exit(1);
     }
 

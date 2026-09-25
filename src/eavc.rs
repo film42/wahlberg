@@ -105,23 +105,6 @@ pub struct WalDebug {
     pub at: DateTime<Utc>,
 }
 
-/// A materialized field value after LWW resolution.
-#[derive(Debug, Clone)]
-pub struct Fact {
-    pub value: serde_json::Value,
-    pub ts: DateTime<Utc>,
-    pub op_id: Ulid,
-    pub user: String,
-}
-
-impl Fact {
-    /// Returns true if `op` wins over the current fact under LWW rules:
-    /// newer timestamp wins; on tie, higher op_id wins.
-    pub fn is_superseded_by(&self, op: &Op) -> bool {
-        op.ts > self.ts || (op.ts == self.ts && op.op_id > self.op_id)
-    }
-}
-
 impl Op {
     pub fn new(
         tbl: impl Into<String>,

@@ -40,11 +40,7 @@ fn exporter_roundtrip() {
         )
         .unwrap();
     store
-        .create(
-            "contacts",
-            "c-2",
-            &[("name", Value::String("Bob".into()))],
-        )
+        .create("contacts", "c-2", &[("name", Value::String("Bob".into()))])
         .unwrap();
     store
         .create(

@@ -5,7 +5,8 @@ use chrono::Utc;
 use serde_json::Value;
 use ulid::Ulid;
 
-use crate::eavc::{Fact, Op, OpType};
+use crate::eavc::{Op, OpType};
+use crate::merge::{DELETED, MergeState, PURGE};
 use crate::wal::{self, WalError, WalReader};
 
 #[derive(Debug, thiserror::Error)]
@@ -15,9 +16,6 @@ pub enum StoreError {
     #[error("entity not found: {table}/{id}")]
     NotFound { table: String, id: String },
 }
-
-/// Key for the materialized current-state map: (table, entity_id, field).
-type FieldKey = (String, String, String);
 
 /// A materialized entity — a bag of field→value pairs.
 #[derive(Debug, Clone)]
@@ -36,8 +34,8 @@ pub struct Store {
     session_id: String,
     user: String,
     reader: WalReader,
-    /// Current materialized state: (tbl, id, field) → Fact
-    current: HashMap<FieldKey, Fact>,
+    /// Current materialized state: (tbl, id, field) → winning op
+    current: MergeState,
     /// Ops waiting to be flushed to disk.
     outbox: Vec<Op>,
 }
@@ -52,7 +50,7 @@ impl Store {
             session_id: session_id.into(),
             user: user.into(),
             reader,
-            current: HashMap::new(),
+            current: MergeState::default(),
             outbox: Vec::new(),
         }
     }
@@ -125,7 +123,7 @@ impl Store {
             tbl: tbl.into(),
             id: id.into(),
             op: OpType::Delete,
-            field: "_deleted".into(),
+            field: DELETED.into(),
             value: Value::Bool(true),
             ts: Utc::now(),
             user: self.user.clone(),
@@ -145,7 +143,7 @@ impl Store {
             tbl: tbl.into(),
             id: id.into(),
             op: OpType::Delete,
-            field: "_purge".into(),
+            field: PURGE.into(),
             value: Value::Bool(true),
             ts: Utc::now(),
             user: self.user.clone(),
@@ -161,8 +159,10 @@ impl Store {
         if self.outbox.is_empty() {
             return Ok(None);
         }
-        let ops: Vec<Op> = self.outbox.drain(..).collect();
-        let path = wal::write_wal(&self.wal_dir, &ops, &self.session_id, &self.user)?;
+        // Only clear the outbox once the file is verified on disk, so a
+        // dropped share doesn't silently discard local edits.
+        let path = wal::write_wal(&self.wal_dir, &self.outbox, &self.session_id, &self.user)?;
+        self.outbox.clear();
         Ok(Some(path))
     }
 
@@ -198,8 +198,8 @@ impl Store {
     pub fn tables(&self) -> Vec<String> {
         let mut tables: Vec<String> = self
             .current
-            .keys()
-            .map(|(t, _, _)| t.clone())
+            .iter()
+            .map(|((t, _, _), _)| t.clone())
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
             .collect();
@@ -215,32 +215,7 @@ impl Store {
     // --- internals ---
 
     fn apply_op(&mut self, op: &Op) {
-        let key = (op.tbl.clone(), op.id.clone(), op.field.clone());
-
-        let dominated = self
-            .current
-            .get(&key)
-            .map(|existing| existing.is_superseded_by(op))
-            .unwrap_or(true);
-
-        if dominated {
-            self.current.insert(
-                key,
-                Fact {
-                    value: op.value.clone(),
-                    ts: op.ts,
-                    op_id: op.op_id,
-                    user: op.user.clone(),
-                },
-            );
-
-            // Purge: strip all non-tombstone tuples for this entity.
-            if op.field == "_purge" && op.value == Value::Bool(true) {
-                self.current.retain(|(t, eid, field), _| {
-                    !(t == &op.tbl && eid == &op.id && field != "_purge")
-                });
-            }
-        }
+        self.current.apply(op.clone());
     }
 
     fn materialize_entity(&self, tbl: &str, id: &str) -> Option<Entity> {
@@ -249,15 +224,15 @@ impl Store {
         let mut deleted = false;
         let mut purged = false;
 
-        for ((t, eid, field), fact) in &self.current {
+        for ((t, eid, field), op) in self.current.iter() {
             if t == tbl && eid == id {
                 found = true;
-                if field == "_purge" && fact.value == Value::Bool(true) {
-                    purged = true;
-                } else if field == "_deleted" && fact.value == Value::Bool(true) {
-                    deleted = true;
-                } else {
-                    fields.insert(field.clone(), fact.value.clone());
+                if field == PURGE {
+                    purged |= op.value == Value::Bool(true);
+                } else if field == DELETED {
+                    deleted |= op.value == Value::Bool(true);
+                } else if !field.starts_with('_') {
+                    fields.insert(field.clone(), op.value.clone());
                 }
             }
         }
@@ -278,9 +253,9 @@ impl Store {
     fn list_entity_ids(&self, tbl: &str) -> Vec<String> {
         let mut ids: Vec<String> = self
             .current
-            .keys()
-            .filter(|(t, _, _)| t == tbl)
-            .map(|(_, id, _)| id.clone())
+            .iter()
+            .filter(|((t, _, _), _)| t == tbl)
+            .map(|((_, id, _), _)| id.clone())
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
             .collect();
@@ -323,10 +298,18 @@ mod tests {
     fn update_entity() {
         let (_dir, mut store) = temp_store();
         store
-            .create("contacts", "c-1", &[("name", Value::String("Alice".into()))])
+            .create(
+                "contacts",
+                "c-1",
+                &[("name", Value::String("Alice".into()))],
+            )
             .unwrap();
         store
-            .update("contacts", "c-1", &[("name", Value::String("Alicia".into()))])
+            .update(
+                "contacts",
+                "c-1",
+                &[("name", Value::String("Alicia".into()))],
+            )
             .unwrap();
 
         let entity = store.get("contacts", "c-1").unwrap();
@@ -337,7 +320,11 @@ mod tests {
     fn soft_delete() {
         let (_dir, mut store) = temp_store();
         store
-            .create("contacts", "c-1", &[("name", Value::String("Alice".into()))])
+            .create(
+                "contacts",
+                "c-1",
+                &[("name", Value::String("Alice".into()))],
+            )
             .unwrap();
         store.delete("contacts", "c-1").unwrap();
 
@@ -350,13 +337,21 @@ mod tests {
     fn list_entities() {
         let (_dir, mut store) = temp_store();
         store
-            .create("contacts", "c-1", &[("name", Value::String("Alice".into()))])
+            .create(
+                "contacts",
+                "c-1",
+                &[("name", Value::String("Alice".into()))],
+            )
             .unwrap();
         store
             .create("contacts", "c-2", &[("name", Value::String("Bob".into()))])
             .unwrap();
         store
-            .create("contacts", "c-3", &[("name", Value::String("Charlie".into()))])
+            .create(
+                "contacts",
+                "c-3",
+                &[("name", Value::String("Charlie".into()))],
+            )
             .unwrap();
         store.delete("contacts", "c-2").unwrap();
 
@@ -375,7 +370,11 @@ mod tests {
         {
             let mut writer = Store::open(dir.path(), "writer", "garrett");
             writer
-                .create("contacts", "c-1", &[("name", Value::String("Alice".into()))])
+                .create(
+                    "contacts",
+                    "c-1",
+                    &[("name", Value::String("Alice".into()))],
+                )
                 .unwrap();
             writer
                 .create("contacts", "c-2", &[("name", Value::String("Bob".into()))])
@@ -406,8 +405,12 @@ mod tests {
         // Two writers both set the same field.
         {
             let mut w1 = Store::open(dir.path(), "w1", "alice");
-            w1.create("contacts", "c-1", &[("name", Value::String("Alice".into()))])
-                .unwrap();
+            w1.create(
+                "contacts",
+                "c-1",
+                &[("name", Value::String("Alice".into()))],
+            )
+            .unwrap();
             w1.flush().unwrap();
         }
 
@@ -434,10 +437,18 @@ mod tests {
     fn tables_listing() {
         let (_dir, mut store) = temp_store();
         store
-            .create("contacts", "c-1", &[("name", Value::String("Alice".into()))])
+            .create(
+                "contacts",
+                "c-1",
+                &[("name", Value::String("Alice".into()))],
+            )
             .unwrap();
         store
-            .create("tasks", "t-1", &[("title", Value::String("Do thing".into()))])
+            .create(
+                "tasks",
+                "t-1",
+                &[("title", Value::String("Do thing".into()))],
+            )
             .unwrap();
 
         let tables = store.tables();

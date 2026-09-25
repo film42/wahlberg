@@ -74,7 +74,7 @@ WAL files are NDJSON (newline-delimited JSON). Each file has three sections:
 
 | Field | Type   | Description |
 |-------|--------|-------------|
-| `v`   | integer | Schema version. Current: `2`. |
+| `v`   | integer | Schema version. Current: `2`. Readers MUST NOT parse files with a version higher than they support (unknown fields would be silently dropped). Compactors MUST NOT merge or delete them. |
 | `t`   | string  | File type: `"f"` = fragment, `"c"` = compact. |
 | `n`   | integer | Number of ops in the file (not counting header or debug lines). |
 | `lo`  | ULID    | Lowest `opId` in the file. |
@@ -112,8 +112,11 @@ The leading ULID ensures files sort in creation order. Files starting with `.` a
 Writers MUST write atomically:
 
 1. Write to a temporary file: `.{filename}.tmp`
-2. Flush / fsync
+2. Flush / fsync (best-effort — some network mounts reject fsync)
 3. Rename to the final filename
+4. Read the final file back and verify it matches what was written (hash + length)
+
+A writer MUST NOT treat a file as committed (e.g. clear its outbox, or delete compaction sources) until step 4 succeeds.
 
 This ensures readers never see a partial file. Any filesystem that supports atomic rename (local, SMB, NFS, FUSE mounts) is a valid transport.
 
@@ -160,7 +163,9 @@ Setting `_purge` to `true` permanently removes an entity. Unlike soft delete:
 
 Purge is eventual. Field tuples may exist in WAL files on disk until compaction runs. Over successive compaction passes, all field data for purged entities is eroded from the filesystem. The tombstone itself persists indefinitely (it is the only record that the entity ever existed and should not be re-created).
 
-**Purge wins over everything.** A `_purge` tombstone cannot be overridden by a newer field write. Once purged, the entity is gone.
+**Purge wins over everything.** A `_purge` tombstone cannot be overridden by a newer field write, nor by a `_purge` write with any other value, regardless of timestamp. For the `_purge` field, `true` beats every non-`true` value; among `true` values, normal LWW applies. Once purged, the entity is gone.
+
+This irreversibility is load-bearing: it is what makes it safe for a compactor with a partial view of the WAL to strip field data. If purge could be undone, a compactor that saw the purge but not the later un-purge would destroy data permanently.
 
 ## Transactions
 
@@ -194,8 +199,9 @@ One WAL file = one batch. This provides application-level atomicity — readers 
 5. Mark the file as processed.
 
 Readers MUST handle:
-- **Corrupt files:** If `header.n` doesn't match the actual op count, or JSON parsing fails, skip the file and log a warning.
-- **Missing files:** Files may be removed by compaction between listing and reading. Treat as a no-op.
+- **Unreadable files:** If `header.n` doesn't match the actual op count, JSON or UTF-8 parsing fails, the version is unsupported, or any other IO error occurs, skip the file and log a warning. Do NOT mark it processed — retry it on the next read. On shared drives and sync folders, "corrupt" often means "not fully arrived yet".
+- **Missing files:** Files may be removed by compaction between listing and reading. Treat as a no-op (and not as processed); the compactor's output carries their ops.
+- A file is marked processed only once its ops have been applied. An error on one file MUST NOT discard ops from other files.
 - **Duplicate ops:** LWW is idempotent. Re-applying the same op produces the same result.
 
 ### Convergence
@@ -213,7 +219,9 @@ Over time, the WAL directory accumulates many small fragment files. Compaction m
 3. LWW merge: for each unique `(tbl, id, field)`, keep only the winning op.
 4. **Purge pass:** for any entity with a winning `_purge` tombstone, drop all non-`_purge` tuples.
 5. Write a new `.compact.wal` file (atomic write, type `"c"` in the header).
-6. Delete the source files only after the compact file is successfully written.
+6. Delete the source files only after the compact file is verified on disk (see [Atomic Writes](#atomic-writes)).
+
+The source set is exactly the files the compactor successfully read. Files it could not read (partial, corrupt, newer version) are never deleted — deleting them could destroy another writer's data. Files that vanish mid-compaction were taken by a concurrent compactor and are skipped.
 
 ### Properties
 
@@ -223,7 +231,8 @@ Over time, the WAL directory accumulates many small fragment files. Compaction m
 
 ### Safety
 
-- Only delete source files after the compact file is committed to disk.
+- Only delete source files after the compact file is committed and verified on disk.
+- Only delete files that were successfully read. Never delete a file because it failed to parse.
 - If a new fragment file appears between the read and delete phases, it will NOT be deleted (it wasn't in the source list). It will be picked up by the next compaction or by readers.
 - In multi-writer environments, consider a file-level lock (`.compact.lock`) to prevent concurrent compactors from racing. The protocol is correct without it, but concurrent compaction wastes work.
 
@@ -290,20 +299,24 @@ That's it. There is no handshake, no protocol negotiation, no schema registry. T
 ### Pseudocode: Materializer
 
 ```
+function wins(new, old):
+    if new.field == "_purge" and is_purge(new) != is_purge(old):
+        return is_purge(new)            // purge is irreversible
+    return new.ts > old.ts or (new.ts == old.ts and new.opId > old.opId)
+
 function apply(op, current_state):
+    if op.field != "_purge" and is_purged(op.tbl, op.id, current_state):
+        return                          // purged entities never regain fields
+
     key = (op.tbl, op.id, op.field)
     existing = current_state.get(key)
-
-    if existing is None:
-        current_state.set(key, op)
+    if existing is not None and not wins(op, existing):
         return
 
-    if op.ts > existing.ts:
-        current_state.set(key, op)     // newer timestamp wins
-    else if op.ts == existing.ts and op.opId > existing.opId:
-        current_state.set(key, op)     // tiebreak: higher ULID wins
+    was_purged = is_purged(op.tbl, op.id, current_state)
+    current_state.set(key, op)
 
-    if op.field == "_purge" and op.value == true:
+    if is_purge(op) and not was_purged:
         // drop all tuples for this (tbl, id) except _purge
         for each key (t, eid, f) in current_state:
             if t == op.tbl and eid == op.id and f != "_purge":

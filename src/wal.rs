@@ -1,11 +1,28 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::hash::{DefaultHasher, Hasher};
+use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
+use serde::Serialize;
 use ulid::Ulid;
 
 use crate::eavc::{Op, WalDebug, WalHeader};
+use crate::merge::MergeState;
+
+/// Highest WAL schema version this build understands. Files with a higher
+/// version are never parsed, merged, or deleted.
+pub const SUPPORTED_VERSION: u32 = 2;
+
+static FSYNC: AtomicBool = AtomicBool::new(true);
+
+/// Enable or disable fsync on WAL writes (process-wide, default on).
+/// Read-back verification always runs. Disabling trades crash durability
+/// for speed — useful in tests, or where the medium ignores fsync anyway.
+pub fn set_fsync(enabled: bool) {
+    FSYNC.store(enabled, Ordering::Relaxed);
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum WalError {
@@ -15,6 +32,14 @@ pub enum WalError {
     Json(#[from] serde_json::Error),
     #[error("corrupt WAL file {path}: {reason}")]
     Corrupt { path: PathBuf, reason: String },
+    #[error("unsupported WAL version {v} in {path} (max {SUPPORTED_VERSION})")]
+    UnsupportedVersion { path: PathBuf, v: u32 },
+}
+
+impl WalError {
+    fn is_not_found(&self) -> bool {
+        matches!(self, WalError::Io(e) if e.kind() == io::ErrorKind::NotFound)
+    }
 }
 
 /// Writes a batch of ops to a new WAL file in the given directory.
@@ -35,47 +60,146 @@ pub fn write_wal(
         });
     }
 
-    let lo = ops.iter().map(|o| o.op_id).min().unwrap();
-    let hi = ops.iter().map(|o| o.op_id).max().unwrap();
-    let file_ulid = Ulid::new();
+    let filename = format!("{}_{}.wal", Ulid::new(), session_id);
+    write_verified(dir, &filename, "f", ops, session_id, user)
+}
 
-    let filename = format!("{}_{}.wal", file_ulid, session_id);
-    let final_path = dir.join(&filename);
+/// Hashes every byte that passes through it.
+struct HashingWriter<W> {
+    inner: W,
+    hasher: DefaultHasher,
+    len: u64,
+}
+
+impl<W: Write> HashingWriter<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            hasher: DefaultHasher::new(),
+            len: 0,
+        }
+    }
+
+    fn digest(&self) -> (u64, u64) {
+        (self.hasher.finish(), self.len)
+    }
+}
+
+impl<W: Write> Write for HashingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.hasher.write(&buf[..n]);
+        self.len += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn write_line<W: Write, T: Serialize>(w: &mut W, value: &T) -> Result<(), WalError> {
+    serde_json::to_writer(&mut *w, value)?;
+    w.write_all(b"\n")?;
+    Ok(())
+}
+
+/// Atomically writes a WAL file and proves it landed:
+///
+/// 1. stream to `.{filename}.tmp`, hashing as we go
+/// 2. fsync (best-effort — some network mounts reject it)
+/// 3. rename to `filename`, fsync the directory (best-effort)
+/// 4. read the final file back and compare its hash and length
+///
+/// Callers may only rely on (e.g. delete sources because of) a file this
+/// function returned `Ok` for.
+fn write_verified(
+    dir: &Path,
+    filename: &str,
+    file_type: &str,
+    ops: &[Op],
+    session_id: &str,
+    user: &str,
+) -> Result<PathBuf, WalError> {
+    let final_path = dir.join(filename);
     let tmp_path = dir.join(format!(".{}.tmp", filename));
 
-    // Write to tmp first, then rename for atomicity.
-    {
+    let written = (|| -> Result<(u64, u64), WalError> {
         let file = fs::File::create(&tmp_path)?;
-        let mut w = BufWriter::new(file);
+        let mut w = HashingWriter::new(BufWriter::new(file));
 
         let header = WalHeader {
-            v: 2,
-            t: "f".into(),
+            v: SUPPORTED_VERSION,
+            t: file_type.into(),
             n: ops.len(),
-            lo,
-            hi,
+            lo: ops.iter().map(|o| o.op_id).min().unwrap(),
+            hi: ops.iter().map(|o| o.op_id).max().unwrap(),
         };
-        serde_json::to_writer(&mut w, &header)?;
-        w.write_all(b"\n")?;
-
+        write_line(&mut w, &header)?;
         let debug = WalDebug {
             sid: session_id.into(),
             user: user.into(),
             at: chrono::Utc::now(),
         };
-        serde_json::to_writer(&mut w, &debug)?;
-        w.write_all(b"\n")?;
-
+        write_line(&mut w, &debug)?;
         for op in ops {
-            serde_json::to_writer(&mut w, op)?;
-            w.write_all(b"\n")?;
+            write_line(&mut w, op)?;
         }
 
-        w.flush()?;
+        let digest = w.digest();
+        let file = w.inner.into_inner().map_err(|e| e.into_error())?;
+        if FSYNC.load(Ordering::Relaxed)
+            && let Err(e) = file.sync_all()
+        {
+            eprintln!(
+                "warning: fsync failed for {}: {}; relying on read-back verification",
+                tmp_path.display(),
+                e
+            );
+        }
+        Ok(digest)
+    })();
+
+    let expected = match written {
+        Ok(d) => d,
+        Err(e) => {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(e);
+        }
+    };
+
+    if let Err(e) = fs::rename(&tmp_path, &final_path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e.into());
+    }
+    if FSYNC.load(Ordering::Relaxed) {
+        sync_dir(dir);
     }
 
-    fs::rename(&tmp_path, &final_path)?;
+    let mut reread = HashingWriter::new(io::sink());
+    io::copy(&mut fs::File::open(&final_path)?, &mut reread)?;
+    if reread.digest() != expected {
+        // Our own file, known bad: remove it so readers don't trip on it.
+        // The caller still holds the ops and can retry.
+        let _ = fs::remove_file(&final_path);
+        return Err(WalError::Corrupt {
+            path: final_path,
+            reason: "read-back verification failed".into(),
+        });
+    }
+
     Ok(final_path)
+}
+
+/// Persists the rename. Best-effort: not meaningful on SMB, and std can't
+/// open a directory handle on Windows.
+fn sync_dir(dir: &Path) {
+    #[cfg(unix)]
+    if let Ok(d) = fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
 }
 
 /// Reads a single WAL file and returns the header and ops.
@@ -94,15 +218,25 @@ pub fn read_wal_file(path: &Path) -> Result<(WalHeader, Vec<Op>), WalError> {
 
     let header: WalHeader = serde_json::from_str(&header_line)?;
 
-    // v2 has a debug line after the header — skip it.
-    if header.v >= 2 {
-        let _debug_line = lines.next().ok_or_else(|| WalError::Corrupt {
+    // Refuse newer formats outright: parsing them with this build's schema
+    // would silently drop fields we don't know about.
+    if header.v == 0 || header.v > SUPPORTED_VERSION {
+        return Err(WalError::UnsupportedVersion {
             path: path.to_path_buf(),
-            reason: "missing debug line".into(),
-        })?;
+            v: header.v,
+        });
     }
 
-    let mut ops = Vec::with_capacity(header.n);
+    // v2 has a debug line after the header — skip it.
+    if header.v >= 2 {
+        lines.next().ok_or_else(|| WalError::Corrupt {
+            path: path.to_path_buf(),
+            reason: "missing debug line".into(),
+        })??;
+    }
+
+    // Don't trust `n` for allocation — a corrupt header could claim 2^60 ops.
+    let mut ops = Vec::with_capacity(header.n.min(4096));
     for line in lines {
         let line = line?;
         if line.is_empty() {
@@ -139,10 +273,24 @@ pub fn list_wal_files(dir: &Path) -> Result<Vec<PathBuf>, WalError> {
     Ok(files)
 }
 
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string()
+}
+
 /// Reader that tracks which WAL files have already been consumed.
+///
+/// A file is marked processed only once its ops are returned. Files that
+/// can't be read (partially arrived, corrupt, newer version, transient IO
+/// error) are skipped and retried on the next `consume`. Files that vanish
+/// were removed by a compactor, whose output carries their ops.
 pub struct WalReader {
     dir: PathBuf,
     processed: BTreeSet<String>,
+    /// In-memory quarantine: filename → last error. Never replicated.
+    failing: HashMap<String, String>,
 }
 
 impl WalReader {
@@ -150,6 +298,7 @@ impl WalReader {
         Self {
             dir: dir.into(),
             processed: BTreeSet::new(),
+            failing: HashMap::new(),
         }
     }
 
@@ -162,13 +311,11 @@ impl WalReader {
         let files = list_wal_files(&self.dir)?;
         let mut all_ops = Vec::new();
 
-        for path in files {
-            let filename = path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
+        let listed: BTreeSet<String> = files.iter().map(|p| file_name(p)).collect();
+        self.failing.retain(|name, _| listed.contains(name));
 
+        for path in files {
+            let filename = file_name(&path);
             if self.processed.contains(&filename) {
                 continue;
             }
@@ -176,17 +323,17 @@ impl WalReader {
             match read_wal_file(&path) {
                 Ok((_header, ops)) => {
                     all_ops.extend(ops);
-                    self.processed.insert(filename);
+                    self.processed.insert(filename.clone());
+                    self.failing.remove(&filename);
                 }
-                Err(WalError::Corrupt { path, reason }) => {
-                    eprintln!("skipping corrupt WAL file {}: {}", path.display(), reason);
-                    self.processed.insert(filename);
+                Err(e) if e.is_not_found() => {}
+                Err(e) => {
+                    let msg = e.to_string();
+                    if self.failing.get(&filename) != Some(&msg) {
+                        eprintln!("skipping WAL file {} (will retry): {}", path.display(), msg);
+                    }
+                    self.failing.insert(filename, msg);
                 }
-                Err(WalError::Json(ref _e)) => {
-                    eprintln!("skipping unparseable WAL file {}: {}", path.display(), _e);
-                    self.processed.insert(filename);
-                }
-                Err(e) => return Err(e),
             }
         }
 
@@ -197,131 +344,72 @@ impl WalReader {
     pub fn processed_files(&self) -> &BTreeSet<String> {
         &self.processed
     }
+
+    /// Files currently being skipped, with the last error seen for each.
+    pub fn failing_files(&self) -> &HashMap<String, String> {
+        &self.failing
+    }
 }
 
-/// Compact a set of WAL files into a single compact file.
+/// Compact the WAL directory into a single compact file.
 ///
-/// Reads all ops from the given files, keeps only the LWW-winning op per
-/// (table, id, attribute) tuple, writes a new `.compact.wal` file, then
-/// removes the source files.
+/// Reads every file it can, merges them (LWW + purge), writes a verified
+/// `.compact.wal`, then deletes exactly the files it read. Files it could not
+/// read are left untouched — they may be partially arrived, from a newer
+/// version, or belong to another writer mid-sync. A file that disappears
+/// mid-compaction was taken by a concurrent compactor and is skipped.
 ///
-/// Returns the path of the new compact file, or None if there were no ops.
+/// Returns the path of the new compact file, or None if nothing was compacted.
 pub fn compact(dir: &Path, session_id: &str) -> Result<Option<PathBuf>, WalError> {
     let files = list_wal_files(dir)?;
-    if files.is_empty() {
-        return Ok(None);
-    }
 
-    // Collect all ops from all files.
-    let mut all_ops: Vec<Op> = Vec::new();
+    let mut state = MergeState::default();
     let mut source_files: Vec<PathBuf> = Vec::new();
 
     for path in &files {
         match read_wal_file(path) {
             Ok((_header, ops)) => {
-                all_ops.extend(ops);
+                for op in ops {
+                    state.apply(op);
+                }
                 source_files.push(path.clone());
             }
-            Err(WalError::Corrupt { .. }) | Err(WalError::Json(_)) => {
-                // Skip corrupt files during compaction — don't lose good data.
-                source_files.push(path.clone());
+            Err(e) if e.is_not_found() => {}
+            Err(e) => {
+                eprintln!("compaction: leaving {} in place: {}", path.display(), e);
             }
-            Err(e) => return Err(e),
         }
     }
 
-    if all_ops.is_empty() {
-        // All files were corrupt or empty — clean them up.
-        for path in &source_files {
-            let _ = fs::remove_file(path);
-        }
+    if source_files.is_empty() {
         return Ok(None);
     }
 
-    // LWW merge: keep only the winning op per (table, id, field).
-    use std::collections::{HashMap, HashSet};
-    let mut winners: HashMap<(String, String, String), Op> = HashMap::new();
-
-    for op in all_ops {
-        let key = (op.tbl.clone(), op.id.clone(), op.field.clone());
-        let dominated = winners.get(&key).map_or(true, |existing| {
-            op.ts > existing.ts || (op.ts == existing.ts && op.op_id > existing.op_id)
-        });
-        if dominated {
-            winners.insert(key, op);
-        }
-    }
-
-    // Collect purged entity IDs — any (tbl, id) with a winning _purge=true.
-    let purged: HashSet<(String, String)> = winners
-        .iter()
-        .filter(|((_, _, field), op)| {
-            field == "_purge" && op.value == serde_json::Value::Bool(true)
-        })
-        .map(|((tbl, id, _), _)| (tbl.clone(), id.clone()))
-        .collect();
-
-    // Drop all non-tombstone tuples for purged entities.
-    if !purged.is_empty() {
-        winners.retain(|(tbl, id, field), _| {
-            if purged.contains(&(tbl.clone(), id.clone())) {
-                field == "_purge"
-            } else {
-                true
-            }
-        });
-    }
-
-    let mut merged_ops: Vec<Op> = winners.into_values().collect();
+    let mut merged_ops = state.into_ops();
     // Sort by op_id for deterministic output.
     merged_ops.sort_by_key(|op| op.op_id);
 
-    // Write compact file.
-    let lo = merged_ops.iter().map(|o| o.op_id).min().unwrap();
-    let hi = merged_ops.iter().map(|o| o.op_id).max().unwrap();
-    let file_ulid = Ulid::new();
-    let filename = format!("{}_{}.compact.wal", file_ulid, session_id);
-    let final_path = dir.join(&filename);
-    let tmp_path = dir.join(format!(".{}.tmp", filename));
+    let compact_path = if merged_ops.is_empty() {
+        // Every source was verified readable and held no ops.
+        None
+    } else {
+        let filename = format!("{}_{}.compact.wal", Ulid::new(), session_id);
+        Some(write_verified(
+            dir,
+            &filename,
+            "c",
+            &merged_ops,
+            session_id,
+            "compactor",
+        )?)
+    };
 
-    {
-        let file = fs::File::create(&tmp_path)?;
-        let mut w = BufWriter::new(file);
-
-        let header = WalHeader {
-            v: 2,
-            t: "c".into(),
-            n: merged_ops.len(),
-            lo,
-            hi,
-        };
-        serde_json::to_writer(&mut w, &header)?;
-        w.write_all(b"\n")?;
-
-        let debug = WalDebug {
-            sid: session_id.into(),
-            user: "compactor".into(),
-            at: chrono::Utc::now(),
-        };
-        serde_json::to_writer(&mut w, &debug)?;
-        w.write_all(b"\n")?;
-
-        for op in &merged_ops {
-            serde_json::to_writer(&mut w, op)?;
-            w.write_all(b"\n")?;
-        }
-
-        w.flush()?;
-    }
-
-    fs::rename(&tmp_path, &final_path)?;
-
-    // Remove source files only after compact file is committed.
+    // Only reached once the compact file is verified on disk.
     for path in &source_files {
         let _ = fs::remove_file(path);
     }
 
-    Ok(Some(final_path))
+    Ok(compact_path)
 }
 
 #[cfg(test)]

@@ -7,7 +7,10 @@ use clap::Parser;
 use wahlberg::wal;
 
 #[derive(Parser)]
-#[command(name = "wal-tail", about = "Tail a WAL directory and log changes as they land")]
+#[command(
+    name = "wal-tail",
+    about = "Tail a WAL directory and log changes as they land"
+)]
 struct Args {
     /// Path to the WAL directory
     #[arg(long)]
@@ -26,7 +29,10 @@ fn main() {
     let args = Args::parse();
 
     if !args.wal_dir.exists() {
-        eprintln!("error: WAL directory does not exist: {}", args.wal_dir.display());
+        eprintln!(
+            "error: WAL directory does not exist: {}",
+            args.wal_dir.display()
+        );
         std::process::exit(1);
     }
 
@@ -83,9 +89,7 @@ fn main() {
                     let user = ops.first().map(|o| o.user.as_str()).unwrap_or("?");
                     println!(
                         "\x1b[36m[wal]\x1b[0m {} — {} ops by \x1b[1m{}\x1b[0m",
-                        filename,
-                        header.n,
-                        user,
+                        filename, header.n, user,
                     );
 
                     for op in &ops {
@@ -115,10 +119,7 @@ fn main() {
                     }
                 }
                 Err(e) => {
-                    eprintln!(
-                        "\x1b[31m[error]\x1b[0m {} — {}",
-                        filename, e,
-                    );
+                    eprintln!("\x1b[31m[error]\x1b[0m {} — {}", filename, e,);
                 }
             }
         }

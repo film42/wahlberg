@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 
 use serde_json::Value;
@@ -110,7 +110,13 @@ fn wal_skips_corrupt_files() {
     std::fs::write(&corrupt_path, "not valid json\n").unwrap();
 
     // Write another good file.
-    wal::write_wal(dir.path(), &[make_op("t", "2", "a", "also-good")], "s1", "t").unwrap();
+    wal::write_wal(
+        dir.path(),
+        &[make_op("t", "2", "a", "also-good")],
+        "s1",
+        "t",
+    )
+    .unwrap();
 
     let mut reader = wal::WalReader::new(dir.path());
     let ops = reader.consume().unwrap();
@@ -165,7 +171,13 @@ fn compact_preserves_distinct_fields() {
     let dir = tmp();
 
     wal::write_wal(dir.path(), &[make_op("t", "1", "name", "Alice")], "s1", "t").unwrap();
-    wal::write_wal(dir.path(), &[make_op("t", "1", "email", "a@b.c")], "s1", "t").unwrap();
+    wal::write_wal(
+        dir.path(),
+        &[make_op("t", "1", "email", "a@b.c")],
+        "s1",
+        "t",
+    )
+    .unwrap();
     wal::write_wal(dir.path(), &[make_op("t", "2", "name", "Bob")], "s1", "t").unwrap();
 
     wal::compact(dir.path(), "compactor").unwrap();
@@ -193,11 +205,19 @@ fn store_reads_compacted_files() {
     {
         let mut store = Store::open(dir.path(), "w", "author");
         store
-            .create("contacts", "c-1", &[("name", Value::String("Alice".into()))])
+            .create(
+                "contacts",
+                "c-1",
+                &[("name", Value::String("Alice".into()))],
+            )
             .unwrap();
         store.flush().unwrap();
         store
-            .update("contacts", "c-1", &[("name", Value::String("Alicia".into()))])
+            .update(
+                "contacts",
+                "c-1",
+                &[("name", Value::String("Alicia".into()))],
+            )
             .unwrap();
         store.flush().unwrap();
         store
@@ -312,8 +332,12 @@ fn store_replication_two_writers() {
     // Writer A
     {
         let mut a = Store::open(dir.path(), "a", "alice");
-        a.create("contacts", "c-1", &[("name", Value::String("Alice".into()))])
-            .unwrap();
+        a.create(
+            "contacts",
+            "c-1",
+            &[("name", Value::String("Alice".into()))],
+        )
+        .unwrap();
         a.create("contacts", "c-2", &[("name", Value::String("Bob".into()))])
             .unwrap();
         a.flush().unwrap();
@@ -322,8 +346,12 @@ fn store_replication_two_writers() {
     // Writer B
     {
         let mut b = Store::open(dir.path(), "b", "bob");
-        b.create("contacts", "c-3", &[("name", Value::String("Charlie".into()))])
-            .unwrap();
+        b.create(
+            "contacts",
+            "c-3",
+            &[("name", Value::String("Charlie".into()))],
+        )
+        .unwrap();
         b.update(
             "contacts",
             "c-1",
@@ -425,10 +453,15 @@ fn purge_removes_entity_from_store() {
     let dir = tmp();
     let mut s = Store::open(dir.path(), "s", "a");
 
-    s.create("contacts", "c-1", &[
-        ("name", Value::String("Alice".into())),
-        ("email", Value::String("a@b.c".into())),
-    ]).unwrap();
+    s.create(
+        "contacts",
+        "c-1",
+        &[
+            ("name", Value::String("Alice".into())),
+            ("email", Value::String("a@b.c".into())),
+        ],
+    )
+    .unwrap();
     assert!(s.get("contacts", "c-1").is_some());
 
     s.purge("contacts", "c-1").unwrap();
@@ -447,8 +480,14 @@ fn purge_replicates_via_wal() {
     // Writer creates and purges.
     {
         let mut w = Store::open(dir.path(), "w", "writer");
-        w.create("contacts", "c-1", &[("name", Value::String("Alice".into()))]).unwrap();
-        w.create("contacts", "c-2", &[("name", Value::String("Bob".into()))]).unwrap();
+        w.create(
+            "contacts",
+            "c-1",
+            &[("name", Value::String("Alice".into()))],
+        )
+        .unwrap();
+        w.create("contacts", "c-2", &[("name", Value::String("Bob".into()))])
+            .unwrap();
         w.purge("contacts", "c-1").unwrap();
         w.flush().unwrap();
     }
@@ -467,7 +506,8 @@ fn purge_is_stronger_than_delete() {
     let dir = tmp();
     let mut s = Store::open(dir.path(), "s", "a");
 
-    s.create("t", "1", &[("x", Value::String("val".into()))]).unwrap();
+    s.create("t", "1", &[("x", Value::String("val".into()))])
+        .unwrap();
     s.delete("t", "1").unwrap();
 
     // Soft-deleted: visible via get_including_deleted.
@@ -489,13 +529,15 @@ fn purge_survives_new_field_writes() {
     let dir = tmp();
     let mut s = Store::open(dir.path(), "s", "a");
 
-    s.create("t", "1", &[("x", Value::String("old".into()))]).unwrap();
+    s.create("t", "1", &[("x", Value::String("old".into()))])
+        .unwrap();
     s.purge("t", "1").unwrap();
 
     // A later write to a different field — the purge tombstone already
     // stripped the entity. The new field gets inserted into `current`
     // but `_purge` is still true, so get() returns None.
-    s.update("t", "1", &[("y", Value::String("new".into()))]).unwrap();
+    s.update("t", "1", &[("y", Value::String("new".into()))])
+        .unwrap();
 
     assert!(s.get("t", "1").is_none());
 }
@@ -507,14 +549,20 @@ fn compaction_strips_purged_tuples() {
     // Write several fields for an entity across multiple WAL files.
     {
         let mut w = Store::open(dir.path(), "w", "a");
-        w.create("contacts", "c-1", &[
-            ("name", Value::String("Alice".into())),
-            ("email", Value::String("a@b.c".into())),
-            ("phone", Value::String("555".into())),
-        ]).unwrap();
+        w.create(
+            "contacts",
+            "c-1",
+            &[
+                ("name", Value::String("Alice".into())),
+                ("email", Value::String("a@b.c".into())),
+                ("phone", Value::String("555".into())),
+            ],
+        )
+        .unwrap();
         w.flush().unwrap();
 
-        w.create("contacts", "c-2", &[("name", Value::String("Bob".into()))]).unwrap();
+        w.create("contacts", "c-2", &[("name", Value::String("Bob".into()))])
+            .unwrap();
         w.flush().unwrap();
 
         // Purge c-1.
@@ -532,7 +580,11 @@ fn compaction_strips_purged_tuples() {
 
     // Should have: c-1/_purge + c-2/name = 2 ops.
     let c1_ops: Vec<_> = ops.iter().filter(|o| o.id == "c-1").collect();
-    assert_eq!(c1_ops.len(), 1, "only the _purge tombstone should remain for c-1");
+    assert_eq!(
+        c1_ops.len(),
+        1,
+        "only the _purge tombstone should remain for c-1"
+    );
     assert_eq!(c1_ops[0].field, "_purge");
 
     let c2_ops: Vec<_> = ops.iter().filter(|o| o.id == "c-2").collect();
@@ -549,7 +601,8 @@ fn compaction_purge_propagates_over_multiple_passes() {
         let mut w = Store::open(dir.path(), "w", "a");
         for i in 0..20 {
             let field = format!("f{}", i);
-            w.update("t", "1", &[(&field, Value::Number(i.into()))]).unwrap();
+            w.update("t", "1", &[(&field, Value::Number(i.into()))])
+                .unwrap();
             // Flush each one separately so they're in different WAL files.
             w.flush().unwrap();
         }
